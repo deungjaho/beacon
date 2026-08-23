@@ -194,13 +194,14 @@ func devinSessionInfo(sessionID string) (title, cwd string) {
 }
 
 // isSafeSessionID returns true if s contains only characters safe for
-// embedding in a SQL string literal: hex digits and hyphens (UUID format).
+// embedding in a SQL string literal: alphanumeric, hyphen, and underscore.
+// Devin session IDs are human-readable names (e.g. "almond-chef"), not UUIDs.
 func isSafeSessionID(s string) bool {
-	if s == "" || len(s) > 64 {
+	if s == "" || len(s) > 128 {
 		return false
 	}
 	for _, c := range s {
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') || c == '-') {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '-' || c == '_') {
 			return false
 		}
 	}

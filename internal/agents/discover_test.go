@@ -7,13 +7,17 @@ func TestIsSafeSessionID(t *testing.T) {
 		id   string
 		want bool
 	}{
-		{"019da80e-bc54-7a60-88b1-f3614832ca5a", true},
+		{"019da80e-bc54-7a60-88b1-f3614832ca5a", true}, // UUID
+		{"almond-chef", true},                          // Devin human-readable name
+		{"brief-hibiscus", true},                       // Devin human-readable name
 		{"abc123", true},
 		{"ABC-123", true},
+		{"session_1", true},
 		{"", false},
 		{"'; DROP TABLE sessions; --", false},
 		{"$(rm -rf /)", false},
-		{string(make([]byte, 65)), false}, // too long
+		{"1' OR '1'='1", false},
+		{string(make([]byte, 129)), false}, // too long
 	}
 	for _, tt := range tests {
 		t.Run(tt.id, func(t *testing.T) {
