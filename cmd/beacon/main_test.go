@@ -1312,7 +1312,6 @@ func TestJumpUsesSwitchClientWithC(t *testing.T) {
 	assertContains(t, logStr, "test-session", "switch-client must target the session")
 }
 
-
 func TestDetectAgentName(t *testing.T) {
 	// 1. Explicit BEACON_AGENT_NAME takes precedence
 	t.Setenv("BEACON_AGENT_NAME", "CustomAgent")

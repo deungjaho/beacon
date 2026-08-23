@@ -203,7 +203,6 @@ func TestStoreLoadHandlesCorruptFile(t *testing.T) {
 	}
 }
 
-
 func TestStripMarkdown(t *testing.T) {
 	tests := []struct {
 		name string

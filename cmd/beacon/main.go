@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/deungjaho/beacon/internal/agents"
 	"github.com/deungjaho/beacon/internal/collector"
 	"github.com/deungjaho/beacon/internal/daemon"
 	"github.com/deungjaho/beacon/internal/render"
@@ -95,6 +96,7 @@ commands:
   reset                   clear local Beacon state
   hook <prompt|stop|notification|permission>
   daemon [start|stop|status]  manage background sampler
+  agents [--json]         list discovered agent sessions across panes
   doctor                  validate local dependencies and state
 `)
 }
@@ -131,6 +133,8 @@ func main() {
 		os.Exit(cmdHook(args))
 	case "daemon":
 		os.Exit(cmdDaemon(args))
+	case "agents":
+		os.Exit(cmdAgents(args))
 	case "doctor":
 		os.Exit(cmdDoctor(args))
 	case "-h", "--help", "help":
@@ -1037,6 +1041,22 @@ func cmdDaemon(args []string) int {
 		fmt.Fprintf(os.Stderr, "beacon: unknown daemon action: %s\n", action)
 		return 2
 	}
+}
+
+func cmdAgents(args []string) int {
+	jsonOut := false
+	for _, a := range args {
+		if a == "--json" || a == "-j" {
+			jsonOut = true
+		}
+	}
+	sessions := agents.DiscoverAll(tmuxBin())
+	if jsonOut {
+		agents.PrintJSON(sessions)
+	} else {
+		agents.PrintTable(sessions)
+	}
+	return 0
 }
 
 func cmdDoctor(args []string) int {
