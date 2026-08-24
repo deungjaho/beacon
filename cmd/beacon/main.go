@@ -785,24 +785,19 @@ func cmdHook(args []string) int {
 		}
 		runReport("working", prompt, cwd)
 		if pantheonCfg.Enabled {
-			go func() {
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				result, err := pantheon.RegisterAgent(ctx, pantheonCfg, pantheon.AgentInfo{
-					Runtime: detectRuntimeName(),
-					Cwd:     cwd,
-					Prompt:  prompt,
-				})
-				if err != nil {
-					// Log to hook error log, don't fail the hook
-					logHookError(fmt.Sprintf("pantheon register: %v", err))
-					return
-				}
-				if result != nil {
-					paneID := pantheon.GetCurrentPaneID()
-					_ = pantheon.SetAgentIDForPane(paneID, result.AgentID)
-				}
-			}()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			result, err := pantheon.RegisterAgent(ctx, pantheonCfg, pantheon.AgentInfo{
+				Runtime: detectRuntimeName(),
+				Cwd:     cwd,
+				Prompt:  prompt,
+			})
+			if err != nil {
+				logHookError(fmt.Sprintf("pantheon register: %v", err))
+			} else if result != nil {
+				paneID := pantheon.GetCurrentPaneID()
+				_ = pantheon.SetAgentIDForPane(paneID, result.AgentID)
+			}
 		}
 	case "stop":
 		msg := strVal("last_assistant_message")
@@ -820,17 +815,14 @@ func cmdHook(args []string) int {
 		runReport("completed", cleanMsg, cwd)
 		runNotify(detectAgentName(), "✓ "+cleanMsg)
 		if pantheonCfg.Enabled {
-			go func() {
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				paneID := pantheon.GetCurrentPaneID()
-				agentID := pantheon.GetAgentIDForPane(paneID)
-				if err := pantheon.CompleteAgent(ctx, pantheonCfg, agentID); err != nil {
-					logHookError(fmt.Sprintf("pantheon complete: %v", err))
-					return
-				}
-				pantheon.ClearAgentIDForPane(paneID)
-			}()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			paneID := pantheon.GetCurrentPaneID()
+			agentID := pantheon.GetAgentIDForPane(paneID)
+			if err := pantheon.CompleteAgent(ctx, pantheonCfg, agentID); err != nil {
+				logHookError(fmt.Sprintf("pantheon complete: %v", err))
+			}
+			pantheon.ClearAgentIDForPane(paneID)
 		}
 	case "notification":
 		msg := strVal("message")
