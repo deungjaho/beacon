@@ -812,14 +812,13 @@ func cmdHook(args []string) int {
 		runReport("completed", cleanMsg, cwd)
 		runNotify(detectAgentName(), "✓ "+cleanMsg)
 		if pantheonCfg.Enabled {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
 			paneID := pantheon.GetCurrentPaneID()
 			agentID := pantheon.GetAgentIDForPane(paneID)
 			if err := pantheon.CompleteAgent(ctx, pantheonCfg, agentID); err != nil {
 				logHookError(fmt.Sprintf("pantheon complete: %v", err))
 			}
-			pantheon.ClearPaneState(paneID)
 		}
 	case "notification":
 		msg := strVal("message")

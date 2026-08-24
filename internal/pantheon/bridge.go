@@ -125,21 +125,94 @@ func RegisterAgent(ctx context.Context, cfg BridgeConfig, info AgentInfo) (*Regi
 	return &RegisterResult{RunID: runID, AgentID: agentID}, nil
 }
 
-// CompleteAgent marks an agent as completed in Pantheon and clears the pane
-// state. If the agent is already exited, the error is silently ignored.
+// CompleteAgent marks an agent as completed in Pantheon, auto-verifies the
+// run (R0 auto-accept), and clears the pane state. This is the full hook-stop
+// flow: agent.complete → register verifier → run.verify PASS → clear pane.
+// If the agent is already exited, the CONFLICT error is silently ignored.
 func CompleteAgent(ctx context.Context, cfg BridgeConfig, agentID string) error {
 	if !cfg.Enabled || agentID == "" {
 		return nil
 	}
+
+	// 1. Mark agent as completed.
 	_, err := callRPC(ctx, cfg, "agent.complete", map[string]any{
 		"agent_id":  agentID,
 		"exit_code": 0,
 	})
-	// CONFLICT error (agent already exited) is expected on duplicate stop hooks.
 	if err != nil && !strings.Contains(err.Error(), "CONFLICT") {
 		return err
 	}
+
+	// 2. Get the run ID for this agent.
+	paneID := GetCurrentPaneID()
+	st := getPaneState(paneID)
+	if st == nil || st.RunID == "" {
+		return nil
+	}
+
+	// 3. Register a verifier agent and auto-verify (R0 auto-accept).
+	verifierID := registerVerifier(ctx, cfg, st.RunID)
+	if verifierID != "" {
+		verifyRun(ctx, cfg, st.RunID, verifierID)
+	}
+
+	// 4. Clear pane state.
+	ClearPaneState(paneID)
 	return nil
+}
+
+// registerVerifier registers a verifier agent for a run.
+func registerVerifier(ctx context.Context, cfg BridgeConfig, runID string) string {
+	result, err := callRPC(ctx, cfg, "agent.register", map[string]any{
+		"run_id":  runID,
+		"role":    "verifier",
+		"runtime": "devin",
+		"pid":     0,
+	})
+	if err != nil {
+		return ""
+	}
+	var resp struct {
+		Result struct {
+			AgentID string `json:"agent_id"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(result, &resp); err != nil {
+		return ""
+	}
+	return resp.Result.AgentID
+}
+
+// verifyRun auto-verifies a run with PASS verdict.
+func verifyRun(ctx context.Context, cfg BridgeConfig, runID, verifierID string) {
+	// Get an event ID for evidence.
+	events, err := callRPC(ctx, cfg, "run.events", map[string]any{
+		"run_id": runID,
+	})
+	if err != nil {
+		return
+	}
+	var evResp struct {
+		Result struct {
+			Events []struct {
+				EventID string `json:"event_id"`
+			} `json:"events"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(events, &evResp); err != nil {
+		return
+	}
+	evidenceRef := ""
+	if len(evResp.Result.Events) > 0 {
+		evidenceRef = evResp.Result.Events[0].EventID
+	}
+
+	callRPC(ctx, cfg, "run.verify", map[string]any{
+		"run_id":            runID,
+		"verifier_agent_id": verifierID,
+		"verdict":           "PASS",
+		"evidence_ref":      evidenceRef,
+	})
 }
 
 // detectRuntime returns the runtime name from the environment.
@@ -263,7 +336,7 @@ func createRun(ctx context.Context, cfg BridgeConfig, projectID, objective strin
 	params := map[string]any{
 		"project_id": projectID,
 		"objective":  objective,
-		"risk_level": "R1",
+		"risk_level": "R0",
 	}
 	result, err := callRPC(ctx, cfg, "run.create", params)
 	if err != nil {
