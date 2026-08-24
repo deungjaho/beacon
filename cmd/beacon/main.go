@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"github.com/deungjaho/beacon/internal/agents"
 	"github.com/deungjaho/beacon/internal/collector"
 	"github.com/deungjaho/beacon/internal/daemon"
+	"github.com/deungjaho/beacon/internal/pantheon"
 	"github.com/deungjaho/beacon/internal/render"
 	"github.com/deungjaho/beacon/internal/state"
 )
@@ -769,6 +771,9 @@ func cmdHook(args []string) int {
 		cwd, _ = os.Getwd()
 	}
 
+	// Pantheon bridge is best-effort: load config once, use it per-event.
+	pantheonCfg := pantheon.LoadConfig()
+
 	switch event {
 	case "prompt":
 		prompt := strVal("prompt")
@@ -779,6 +784,26 @@ func cmdHook(args []string) int {
 			prompt = strVal("input")
 		}
 		runReport("working", prompt, cwd)
+		if pantheonCfg.Enabled {
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				result, err := pantheon.RegisterAgent(ctx, pantheonCfg, pantheon.AgentInfo{
+					Runtime: detectRuntimeName(),
+					Cwd:     cwd,
+					Prompt:  prompt,
+				})
+				if err != nil {
+					// Log to hook error log, don't fail the hook
+					logHookError(fmt.Sprintf("pantheon register: %v", err))
+					return
+				}
+				if result != nil {
+					paneID := pantheon.GetCurrentPaneID()
+					_ = pantheon.SetAgentIDForPane(paneID, result.AgentID)
+				}
+			}()
+		}
 	case "stop":
 		msg := strVal("last_assistant_message")
 		if msg == "" {
@@ -794,6 +819,19 @@ func cmdHook(args []string) int {
 		cleanMsg = state.SanitizeSummary(cleanMsg)
 		runReport("completed", cleanMsg, cwd)
 		runNotify(detectAgentName(), "✓ "+cleanMsg)
+		if pantheonCfg.Enabled {
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				paneID := pantheon.GetCurrentPaneID()
+				agentID := pantheon.GetAgentIDForPane(paneID)
+				if err := pantheon.CompleteAgent(ctx, pantheonCfg, agentID); err != nil {
+					logHookError(fmt.Sprintf("pantheon complete: %v", err))
+					return
+				}
+				pantheon.ClearAgentIDForPane(paneID)
+			}()
+		}
 	case "notification":
 		msg := strVal("message")
 		if msg == "" {
@@ -1167,4 +1205,33 @@ func detectAgentName() string {
 		return "Claude"
 	}
 	return "Agent"
+}
+
+// detectRuntimeName returns the Pantheon runtime identifier for the current
+// environment. It mirrors detectAgentName but yields the lowercase runtime
+// name expected by Pantheon (devin/claude/codex).
+func detectRuntimeName() string {
+	if os.Getenv("CODEX_THREAD_ID") != "" || os.Getenv("CODEX_CI") != "" {
+		return "codex"
+	}
+	if os.Getenv("CLAUDE_CODE_ENTRYPOINT") != "" {
+		return "claude"
+	}
+	return "devin"
+}
+
+// logHookError appends a timestamped message to the hook-errors log in the
+// Beacon state directory. It is best-effort and never returns an error.
+func logHookError(msg string) {
+	stateDir := defaultStateDir()
+	if stateDir == "" {
+		return
+	}
+	path := filepath.Join(stateDir, "hook-errors.log")
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "%s %s\n", time.Now().Format(time.RFC3339), msg)
 }
