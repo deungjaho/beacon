@@ -787,16 +787,13 @@ func cmdHook(args []string) int {
 		if pantheonCfg.Enabled {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			result, err := pantheon.RegisterAgent(ctx, pantheonCfg, pantheon.AgentInfo{
+			_, err := pantheon.RegisterAgent(ctx, pantheonCfg, pantheon.AgentInfo{
 				Runtime: detectRuntimeName(),
 				Cwd:     cwd,
 				Prompt:  prompt,
 			})
 			if err != nil {
 				logHookError(fmt.Sprintf("pantheon register: %v", err))
-			} else if result != nil {
-				paneID := pantheon.GetCurrentPaneID()
-				_ = pantheon.SetAgentIDForPane(paneID, result.AgentID)
 			}
 		}
 	case "stop":
@@ -822,7 +819,7 @@ func cmdHook(args []string) int {
 			if err := pantheon.CompleteAgent(ctx, pantheonCfg, agentID); err != nil {
 				logHookError(fmt.Sprintf("pantheon complete: %v", err))
 			}
-			pantheon.ClearAgentIDForPane(paneID)
+			pantheon.ClearPaneState(paneID)
 		}
 	case "notification":
 		msg := strVal("message")
