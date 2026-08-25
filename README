@@ -1,7 +1,7 @@
 Beacon
 ======
 
-A local-first attention and status tool for agent-driven terminal work.
+A local agent status tracking and tmux notification tool.
 Agent lifecycle hooks write a small bounded JSON snapshot, tmux renders
 it, notifications surface events, and `beacon jump` returns to the most
 recently completed pane.
