@@ -45,6 +45,8 @@ type Metrics struct {
 	MemPressureOK bool    `json:"mem_pressure_ok"`
 	ProcCount     int     `json:"proc_count"`
 	ProcCountOK   bool    `json:"proc_count_ok"`
+	ThreadCount   int     `json:"thread_count,omitempty"`
+	ThreadCountOK bool    `json:"thread_count_ok,omitempty"`
 
 	// Thermal pressure level (macOS: 0=nominal, 1=moderate, 2=heavy, 3=trapping)
 	ThermalLevel int  `json:"thermal_level"`
@@ -138,20 +140,22 @@ type paneMemoryResult struct {
 
 // FastResult holds the sampled metrics for the fast tier.
 type FastResult struct {
-	CPU          float64
-	CPUOK        bool
-	Pressure     int
-	PressureOK   bool
-	ProcCount    int
-	ProcCountOK  bool
-	LoadAvg1m    float64
-	LoadAvgOK    bool
-	ThermalLevel int
-	ThermalOK    bool
-	RealFreeKB   uint64
-	RealFreeOK   bool
-	CompressorKB uint64
-	CompressorOK bool
+	CPU           float64
+	CPUOK         bool
+	Pressure      int
+	PressureOK    bool
+	ProcCount     int
+	ProcCountOK   bool
+	ThreadCount   int
+	ThreadCountOK bool
+	LoadAvg1m     float64
+	LoadAvgOK     bool
+	ThermalLevel  int
+	ThermalOK     bool
+	RealFreeKB    uint64
+	RealFreeOK    bool
+	CompressorKB  uint64
+	CompressorOK  bool
 }
 
 var cpuUsagePattern = regexp.MustCompile(`CPU usage:\s*([0-9.]+)% user,\s*([0-9.]+)% sys,`)
@@ -329,15 +333,55 @@ func parseMacOSThermalLevel(output string) (int, bool) {
 	return 0, false
 }
 
-func parseLinuxLoadAvg(output string) (float64, bool) {
+func parseLinuxLoadAvg(output string) (load float64, loadOK bool, threads int, threadsOK bool) {
 	fields := strings.Fields(strings.TrimSpace(output))
 	if len(fields) > 0 {
 		l1, err := strconv.ParseFloat(fields[0], 64)
 		if err == nil {
-			return l1, true
+			load = l1
+			loadOK = true
 		}
 	}
-	return 0, false
+	if len(fields) >= 4 {
+		slash := strings.Index(fields[3], "/")
+		if slash >= 0 {
+			t, err := strconv.Atoi(fields[3][slash+1:])
+			if err == nil && t > 0 {
+				threads = t
+				threadsOK = true
+			}
+		}
+	}
+	return
+}
+
+// parseMacOSThreadAndProcCount parses `ps -M -A` output on macOS.
+// Lines starting with a non-space character (USER) indicate a distinct process.
+// Total non-header lines indicate total threads.
+func parseMacOSThreadAndProcCount(output string) (procs int, procsOK bool, threads int, threadsOK bool) {
+	scanner := bufio.NewScanner(strings.NewReader(output))
+	first := true
+	for scanner.Scan() {
+		line := scanner.Text()
+		if first {
+			first = false
+			continue
+		}
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		threads++
+		if len(line) > 0 && line[0] != ' ' && line[0] != '\t' {
+			procs++
+		}
+	}
+	if procs > 0 {
+		procsOK = true
+	}
+	if threads > 0 {
+		threadsOK = true
+	}
+	return
 }
 
 // parseMacOSProcCount extracts the process count from top's "Processes: N total" line.
@@ -853,7 +897,7 @@ func (c *Collector) SampleFast() FastResult {
 		}
 	}
 	if !res.LoadAvgOK && loadErr == nil && c.os == "linux" {
-		res.LoadAvg1m, res.LoadAvgOK = parseLinuxLoadAvg(string(loadOut))
+		res.LoadAvg1m, res.LoadAvgOK, res.ThreadCount, res.ThreadCountOK = parseLinuxLoadAvg(string(loadOut))
 	}
 
 	// Parse memory pressure, real free, and compressor.
@@ -872,10 +916,19 @@ func (c *Collector) SampleFast() FastResult {
 		}
 	}
 
-	// Parse process count.
+	// Parse process and thread count.
 	if procErr == nil {
-		res.ProcCount = parseProcCount(string(procOut))
-		res.ProcCountOK = true
+		switch c.os {
+		case "darwin":
+			res.ProcCount, res.ProcCountOK, res.ThreadCount, res.ThreadCountOK = parseMacOSThreadAndProcCount(string(procOut))
+			if !res.ProcCountOK {
+				res.ProcCount = parseProcCount(string(procOut))
+				res.ProcCountOK = true
+			}
+		default:
+			res.ProcCount = parseProcCount(string(procOut))
+			res.ProcCountOK = true
+		}
 	}
 
 	// Parse thermal.
@@ -917,8 +970,13 @@ func (c *Collector) sampleCPUOutput() ([]byte, error) {
 }
 
 // sampleProcCountOutput returns raw process count output.
-// Both macOS and Linux: ps aux.
+// macOS: ps -M -A (includes threads); Linux: ps aux.
 func (c *Collector) sampleProcCountOutput() ([]byte, error) {
+	if c.os == "darwin" {
+		if out, err := runCommand("ps", "-M", "-A"); err == nil {
+			return out, nil
+		}
+	}
 	return runCommand("ps", "aux")
 }
 

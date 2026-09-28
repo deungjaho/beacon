@@ -75,9 +75,13 @@ func Render(args Args, m collector.Metrics) string {
 	return formatPowerline(statusBG, segments)
 }
 
-// buildSegments builds resource-only segments in strict order.
-// In compact mode, only the pinned metrics (CPU, memory pressure, real free memory)
-// are rendered for status-right. Otherwise all segments are rendered.
+// buildSegments builds resource-only segments in strict order:
+// CPU, thermal, load, memory pressure, real free memory, compressor,
+// thread/process count, pane memory, window memory, session memory, total tmux memory,
+// root disk usage.
+// In compact mode, the 7 host health metrics (CPU, thermal, load, memory pressure,
+// real free memory, compressor, thread/process count) are rendered for status-right.
+// In full mode, all 12 segments are rendered.
 func buildSegments(args Args, m collector.Metrics) []Segment {
 	var segs []Segment
 
@@ -91,26 +95,24 @@ func buildSegments(args Args, m collector.Metrics) []Segment {
 		})
 	}
 
-	if !args.Compact {
-		// 2. Thermal pressure level
-		if m.ThermalOK {
-			segs = append(segs, Segment{
-				FG:   "#1d1f21",
-				BG:   thermalBGColor(m.ThermalLevel),
-				Text: fmt.Sprintf("%s L%d", iconThermal, m.ThermalLevel),
-				Bold: m.ThermalLevel > 0,
-			})
-		}
+	// 2. Thermal pressure level
+	if m.ThermalOK {
+		segs = append(segs, Segment{
+			FG:   "#1d1f21",
+			BG:   thermalBGColor(m.ThermalLevel),
+			Text: fmt.Sprintf("%s L%d", iconThermal, m.ThermalLevel),
+			Bold: m.ThermalLevel > 0,
+		})
+	}
 
-		// 3. System Load average (1m)
-		if m.LoadAvgOK {
-			segs = append(segs, Segment{
-				FG:   "#1d1f21",
-				BG:   loadAvgBGColor(m.LoadAvg1m),
-				Text: fmt.Sprintf("%s %.1f", iconLoad, m.LoadAvg1m),
-				Bold: m.LoadAvg1m >= 10.0,
-			})
-		}
+	// 3. System Load average (1m)
+	if m.LoadAvgOK {
+		segs = append(segs, Segment{
+			FG:   "#1d1f21",
+			BG:   loadAvgBGColor(m.LoadAvg1m),
+			Text: fmt.Sprintf("%s %.1f", iconLoad, m.LoadAvg1m),
+			Bold: m.LoadAvg1m >= 10.0,
+		})
 	}
 
 	// 4. Memory pressure
@@ -133,27 +135,34 @@ func buildSegments(args Args, m collector.Metrics) []Segment {
 		})
 	}
 
+	// 6. Memory compressor usage
+	if m.CompressorMemOK && m.CompressorMem != "" {
+		segs = append(segs, Segment{
+			FG:   "#1d1f21",
+			BG:   compressorBGColor(m.CompressorMemKB),
+			Text: fmt.Sprintf("%s %s", iconCompressor, m.CompressorMem),
+			Bold: m.CompressorMemKB >= 4*1024*1024,
+		})
+	}
+
+	// 7. Thread/Process count
+	if m.ThreadCountOK && m.ThreadCount > 0 {
+		segs = append(segs, Segment{
+			FG:   "#1d1f21",
+			BG:   "#B48EAD",
+			Text: fmt.Sprintf("%s %d", iconProcCount, m.ThreadCount),
+			Bold: true,
+		})
+	} else if m.ProcCountOK {
+		segs = append(segs, Segment{
+			FG:   "#1d1f21",
+			BG:   "#B48EAD",
+			Text: fmt.Sprintf("%s %d", iconProcCount, m.ProcCount),
+			Bold: true,
+		})
+	}
+
 	if !args.Compact {
-		// 6. Memory compressor usage
-		if m.CompressorMemOK && m.CompressorMem != "" {
-			segs = append(segs, Segment{
-				FG:   "#1d1f21",
-				BG:   compressorBGColor(m.CompressorMemKB),
-				Text: fmt.Sprintf("%s %s", iconCompressor, m.CompressorMem),
-				Bold: m.CompressorMemKB >= 4*1024*1024,
-			})
-		}
-
-		// 7. Process count
-		if m.ProcCountOK {
-			segs = append(segs, Segment{
-				FG:   "#1d1f21",
-				BG:   "#B48EAD",
-				Text: fmt.Sprintf("%s %d", iconProcCount, m.ProcCount),
-				Bold: true,
-			})
-		}
-
 		// 8. Pane memory
 		if args.PaneID != "" {
 			if v, ok := m.PaneMem[args.PaneID]; ok && v != "" {

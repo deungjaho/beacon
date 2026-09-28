@@ -88,10 +88,14 @@ func Render(d Data) string {
 	sb.WriteString(fmt.Sprintf("  系统平均负载:     %s\n", loadStr))
 
 	procStr := "n/a"
-	if d.Metrics.ProcCountOK {
+	if d.Metrics.ProcCountOK && d.Metrics.ThreadCountOK && d.Metrics.ThreadCount > 0 {
+		procStr = fmt.Sprintf("%d procs / %d threads", d.Metrics.ProcCount, d.Metrics.ThreadCount)
+	} else if d.Metrics.ThreadCountOK && d.Metrics.ThreadCount > 0 {
+		procStr = fmt.Sprintf("%d threads", d.Metrics.ThreadCount)
+	} else if d.Metrics.ProcCountOK {
 		procStr = fmt.Sprintf("%d procs", d.Metrics.ProcCount)
 	}
-	sb.WriteString(fmt.Sprintf("  系统进程总数:     %s\n", procStr))
+	sb.WriteString(fmt.Sprintf("  系统进程/线程:   %s\n", procStr))
 	sb.WriteString("\n")
 
 	// Memory Subsystem

@@ -227,6 +227,10 @@ func (d *Daemon) sampleFast() {
 		m.ProcCount = res.ProcCount
 		m.ProcCountOK = true
 	}
+	if res.ThreadCountOK {
+		m.ThreadCount = res.ThreadCount
+		m.ThreadCountOK = true
+	}
 	if res.LoadAvgOK {
 		m.LoadAvg1m = res.LoadAvg1m
 		m.LoadAvgOK = true

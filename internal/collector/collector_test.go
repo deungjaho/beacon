@@ -83,6 +83,23 @@ func TestParseProcCount(t *testing.T) {
 	}
 }
 
+func TestParseMacOSThreadAndProcCount(t *testing.T) {
+	input := `USER               PID   TT   %CPU STAT PRI     STIME     UTIME COMMAND
+root                 1   ??    0.0 S    31T   0:00.02   0:00.00 /sbin/launchd
+                     1         0.0 S    37T   0:00.23   0:00.05 
+                     1         0.0 S    37T   0:00.19   0:00.02 
+user               147   ??    0.0 S    47T   0:00.05   0:00.09 /bin/zsh
+                   147         0.0 S    47T   0:00.00   0:00.00 
+`
+	procs, procsOK, threads, threadsOK := parseMacOSThreadAndProcCount(input)
+	if !procsOK || procs != 2 {
+		t.Fatalf("procs: got %d (ok=%v), want 2 (true)", procs, procsOK)
+	}
+	if !threadsOK || threads != 5 {
+		t.Fatalf("threads: got %d (ok=%v), want 5 (true)", threads, threadsOK)
+	}
+}
+
 func TestParsePsPidPpidMemory(t *testing.T) {
 	input := "  PID  PPID    RSS\n    1     0   8960\n  410     1  18000\n  516     1   9120\n  517   410   6192\n"
 	procs := parsePsPidPpidMemory(input)

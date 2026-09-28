@@ -726,6 +726,8 @@ func TestRenderCompactMode(t *testing.T) {
 		LoadAvg1m:       2.8,
 		ProcCount:       780,
 		ProcCountOK:     true,
+		ThreadCount:     4200,
+		ThreadCountOK:   true,
 		CompressorMemOK: true,
 		CompressorMem:   "3.3G",
 		TotalMem:        "950M",
@@ -735,9 +737,15 @@ func TestRenderCompactMode(t *testing.T) {
 	args := Args{Width: 300, StatusBG: "black", Compact: true}
 	out := Render(args, m)
 
-	// In compact mode, ONLY CPU, pressure, and real free mem must be present.
+	// In compact mode, the 7 host metrics must be present.
 	if !strings.Contains(out, "\uf4bc 25%") {
 		t.Fatalf("compact: missing CPU: %q", out)
+	}
+	if !strings.Contains(out, "L1") {
+		t.Fatalf("compact: missing thermal: %q", out)
+	}
+	if !strings.Contains(out, "2.8") {
+		t.Fatalf("compact: missing load avg: %q", out)
 	}
 	if !strings.Contains(out, "\uf080 35%") {
 		t.Fatalf("compact: missing pressure: %q", out)
@@ -745,8 +753,15 @@ func TestRenderCompactMode(t *testing.T) {
 	if !strings.Contains(out, "\uf2db 1.1G") {
 		t.Fatalf("compact: missing real free mem: %q", out)
 	}
-	// Banned in compact mode:
-	for _, unwanted := range []string{"L1", "2.8", "780", "3.3G", "950M", "195G"} {
+	if !strings.Contains(out, "3.3G") {
+		t.Fatalf("compact: missing compressor: %q", out)
+	}
+	if !strings.Contains(out, "4200") {
+		t.Fatalf("compact: missing thread count: %q", out)
+	}
+
+	// Banned in compact mode: tmux memory hierarchy and disk
+	for _, unwanted := range []string{"950M", "195G"} {
 		if strings.Contains(out, unwanted) {
 			t.Fatalf("compact: must not contain %q: %q", unwanted, out)
 		}
