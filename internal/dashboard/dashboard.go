@@ -175,7 +175,7 @@ func Render(d Data) string {
 	}
 
 	sb.WriteString(colorDim + strings.Repeat("─", 78) + colorReset + "\n")
-	sb.WriteString(fmt.Sprintf(" %s[q / Esc / Enter]%s 退出看板    %s[r]%s 手动刷新    %s(每 2 秒自动采样更新)%s\n",
+	sb.WriteString(fmt.Sprintf(" %s[q / Esc]%s 退出看板    %s[r]%s 手动刷新    %s(每 2 秒自动采样更新)%s\n",
 		colorBold, colorReset, colorBold, colorReset, colorDim, colorReset))
 
 	return sb.String()

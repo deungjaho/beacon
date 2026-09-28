@@ -375,14 +375,16 @@ func isTerminal(f *os.File) bool {
 }
 
 func setupRawTerminal() (func(), error) {
-	out, err := exec.Command("stty", "-g").Output()
+	cmdGet := exec.Command("stty", "-g")
+	cmdGet.Stdin = os.Stdin
+	out, err := cmdGet.Output()
 	if err != nil {
 		return nil, err
 	}
 	saved := strings.TrimSpace(string(out))
-	cmd := exec.Command("stty", "cbreak", "-echo")
-	cmd.Stdin = os.Stdin
-	if err := cmd.Run(); err != nil {
+	cmdSet := exec.Command("stty", "cbreak", "-echo")
+	cmdSet.Stdin = os.Stdin
+	if err := cmdSet.Run(); err != nil {
 		return nil, err
 	}
 	restore := func() {
@@ -429,13 +431,10 @@ func cmdDashboard(args []string) int {
 		return 0
 	}
 
-	restore, err := setupRawTerminal()
-	if err != nil {
-		data := loadData()
-		fmt.Print(dashboard.Render(data))
-		return 0
+	restore, _ := setupRawTerminal()
+	if restore != nil {
+		defer restore()
 	}
-	defer restore()
 
 	// Hide cursor
 	fmt.Print("\033[?25l")
@@ -444,7 +443,7 @@ func cmdDashboard(args []string) int {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
-	keyCh := make(chan byte, 8)
+	keyCh := make(chan byte, 32)
 	go func() {
 		buf := make([]byte, 1)
 		for {
@@ -474,8 +473,23 @@ func cmdDashboard(args []string) int {
 			return 0
 		case b := <-keyCh:
 			switch b {
-			case 'q', 'Q', 27, '\n', '\r', 3: // 27 = Esc, 3 = Ctrl-C
+			case 'q', 'Q', 3: // 3 = Ctrl-C
 				return 0
+			case 27: // Esc
+				time.Sleep(30 * time.Millisecond)
+				isSeq := false
+				for {
+					select {
+					case <-keyCh:
+						isSeq = true
+					default:
+						goto escChecked
+					}
+				}
+			escChecked:
+				if !isSeq {
+					return 0
+				}
 			case 'r', 'R':
 				redraw()
 			}
