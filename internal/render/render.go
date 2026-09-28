@@ -16,6 +16,7 @@ package render
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/deungjaho/beacon/internal/collector"
@@ -29,6 +30,7 @@ type Args struct {
 	WindowIndex string
 	PaneID      string
 	WindowID    string
+	Compact     bool
 }
 
 // Segment is a single Powerline segment.
@@ -58,6 +60,9 @@ const (
 // All available metrics are always output in fixed order; tmux handles
 // truncation when the terminal is too narrow.
 func Render(args Args, m collector.Metrics) string {
+	if !args.Compact && os.Getenv("BEACON_COMPACT_STATUS") == "1" {
+		args.Compact = true
+	}
 	statusBG := args.StatusBG
 	if statusBG == "" || statusBG == "default" {
 		statusBG = "black"
@@ -70,10 +75,9 @@ func Render(args Args, m collector.Metrics) string {
 	return formatPowerline(statusBG, segments)
 }
 
-// buildSegments builds resource-only segments in strict order:
-// CPU, thermal, load, memory pressure, real free memory, compressor,
-// process count, pane memory, window memory, session memory, total tmux memory,
-// root disk usage.
+// buildSegments builds resource-only segments in strict order.
+// In compact mode, only the pinned metrics (CPU, memory pressure, real free memory)
+// are rendered for status-right. Otherwise all segments are rendered.
 func buildSegments(args Args, m collector.Metrics) []Segment {
 	var segs []Segment
 
@@ -87,24 +91,26 @@ func buildSegments(args Args, m collector.Metrics) []Segment {
 		})
 	}
 
-	// 2. Thermal pressure level
-	if m.ThermalOK {
-		segs = append(segs, Segment{
-			FG:   "#1d1f21",
-			BG:   thermalBGColor(m.ThermalLevel),
-			Text: fmt.Sprintf("%s L%d", iconThermal, m.ThermalLevel),
-			Bold: m.ThermalLevel > 0,
-		})
-	}
+	if !args.Compact {
+		// 2. Thermal pressure level
+		if m.ThermalOK {
+			segs = append(segs, Segment{
+				FG:   "#1d1f21",
+				BG:   thermalBGColor(m.ThermalLevel),
+				Text: fmt.Sprintf("%s L%d", iconThermal, m.ThermalLevel),
+				Bold: m.ThermalLevel > 0,
+			})
+		}
 
-	// 3. System Load average (1m)
-	if m.LoadAvgOK {
-		segs = append(segs, Segment{
-			FG:   "#1d1f21",
-			BG:   loadAvgBGColor(m.LoadAvg1m),
-			Text: fmt.Sprintf("%s %.1f", iconLoad, m.LoadAvg1m),
-			Bold: m.LoadAvg1m >= 10.0,
-		})
+		// 3. System Load average (1m)
+		if m.LoadAvgOK {
+			segs = append(segs, Segment{
+				FG:   "#1d1f21",
+				BG:   loadAvgBGColor(m.LoadAvg1m),
+				Text: fmt.Sprintf("%s %.1f", iconLoad, m.LoadAvg1m),
+				Bold: m.LoadAvg1m >= 10.0,
+			})
+		}
 	}
 
 	// 4. Memory pressure
@@ -127,74 +133,74 @@ func buildSegments(args Args, m collector.Metrics) []Segment {
 		})
 	}
 
-	// 6. Memory compressor usage
-	if m.CompressorMemOK && m.CompressorMem != "" {
-		segs = append(segs, Segment{
-			FG:   "#1d1f21",
-			BG:   compressorBGColor(m.CompressorMemKB),
-			Text: fmt.Sprintf("%s %s", iconCompressor, m.CompressorMem),
-			Bold: m.CompressorMemKB >= 4*1024*1024,
-		})
-	}
-
-	// 7. Process count
-	if m.ProcCountOK {
-		segs = append(segs, Segment{
-			FG:   "#1d1f21",
-			BG:   "#B48EAD",
-			Text: fmt.Sprintf("%s %d", iconProcCount, m.ProcCount),
-			Bold: true,
-		})
-	}
-
-	// 4. Pane memory
-	if args.PaneID != "" {
-		if v, ok := m.PaneMem[args.PaneID]; ok && v != "" {
+	if !args.Compact {
+		// 6. Memory compressor usage
+		if m.CompressorMemOK && m.CompressorMem != "" {
 			segs = append(segs, Segment{
 				FG:   "#1d1f21",
-				BG:   "#7CB8BB",
-				Text: fmt.Sprintf("%s %s", iconPaneMem, v),
+				BG:   compressorBGColor(m.CompressorMemKB),
+				Text: fmt.Sprintf("%s %s", iconCompressor, m.CompressorMem),
+				Bold: m.CompressorMemKB >= 4*1024*1024,
 			})
 		}
-	}
 
-	// 5. Window memory
-	wkey := args.SessionName + ":" + args.WindowIndex
-	if v, ok := m.WindowMem[wkey]; ok && v != "" {
-		segs = append(segs, Segment{
-			FG:   "#F4F4E6",
-			BG:   "#5A8A8A",
-			Text: fmt.Sprintf("%s %s", iconWindowMem, v),
-		})
-	}
+		// 7. Process count
+		if m.ProcCountOK {
+			segs = append(segs, Segment{
+				FG:   "#1d1f21",
+				BG:   "#B48EAD",
+				Text: fmt.Sprintf("%s %d", iconProcCount, m.ProcCount),
+				Bold: true,
+			})
+		}
 
-	// 6. Session memory
-	if v, ok := m.SessionMem[args.SessionName]; ok && v != "" {
-		segs = append(segs, Segment{
-			FG:   "#F4F4E6",
-			BG:   "#4A7A7A",
-			Text: fmt.Sprintf("%s %s", iconSessionMem, v),
-		})
-	}
+		// 8. Pane memory
+		if args.PaneID != "" {
+			if v, ok := m.PaneMem[args.PaneID]; ok && v != "" {
+				segs = append(segs, Segment{
+					FG:   "#1d1f21",
+					BG:   "#7CB8BB",
+					Text: fmt.Sprintf("%s %s", iconPaneMem, v),
+				})
+			}
+		}
 
-	// 7. Total tmux memory
-	if m.TotalMem != "" {
-		segs = append(segs, Segment{
-			FG:   "#F4F4E6",
-			BG:   "#3A6A6A",
-			Text: fmt.Sprintf("%s %s", iconTotalMem, m.TotalMem),
-		})
-	}
+		// 9. Window memory
+		wkey := args.SessionName + ":" + args.WindowIndex
+		if v, ok := m.WindowMem[wkey]; ok && v != "" {
+			segs = append(segs, Segment{
+				FG:   "#F4F4E6",
+				BG:   "#5A8A8A",
+				Text: fmt.Sprintf("%s %s", iconWindowMem, v),
+			})
+		}
 
-	// 8. Root disk usage (used only; total is in snapshot/status JSON)
-	// Background is warm-brown by default, red when available < 5 GiB.
-	// Color is judged from the raw df Available field, not total-used.
-	if m.DiskOK && m.DiskUsed != "" {
-		segs = append(segs, Segment{
-			FG:   "#1d1f21",
-			BG:   diskBGColor(m.DiskAvailableKB),
-			Text: fmt.Sprintf("%s %s", iconDisk, m.DiskUsed),
-		})
+		// 10. Session memory
+		if v, ok := m.SessionMem[args.SessionName]; ok && v != "" {
+			segs = append(segs, Segment{
+				FG:   "#F4F4E6",
+				BG:   "#4A7A7A",
+				Text: fmt.Sprintf("%s %s", iconSessionMem, v),
+			})
+		}
+
+		// 11. Total tmux memory
+		if m.TotalMem != "" {
+			segs = append(segs, Segment{
+				FG:   "#F4F4E6",
+				BG:   "#3A6A6A",
+				Text: fmt.Sprintf("%s %s", iconTotalMem, m.TotalMem),
+			})
+		}
+
+		// 12. Root disk usage
+		if m.DiskOK && m.DiskUsed != "" {
+			segs = append(segs, Segment{
+				FG:   "#1d1f21",
+				BG:   diskBGColor(m.DiskAvailableKB),
+				Text: fmt.Sprintf("%s %s", iconDisk, m.DiskUsed),
+			})
+		}
 	}
 
 	return segs

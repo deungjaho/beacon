@@ -710,3 +710,45 @@ func TestRenderNewResourceMetrics(t *testing.T) {
 		t.Fatalf("missing compressor mem: %q", out)
 	}
 }
+
+func TestRenderCompactMode(t *testing.T) {
+	m := collector.Metrics{
+		CPUPercent:      25,
+		CPUOK:           true,
+		MemPressure:     35,
+		MemPressureOK:   true,
+		RealFreeMemOK:   true,
+		RealFreeMem:     "1.1G",
+		RealFreeMemKB:   1100 * 1024,
+		ThermalOK:       true,
+		ThermalLevel:    1,
+		LoadAvgOK:       true,
+		LoadAvg1m:       2.8,
+		ProcCount:       780,
+		ProcCountOK:     true,
+		CompressorMemOK: true,
+		CompressorMem:   "3.3G",
+		TotalMem:        "950M",
+		DiskOK:          true,
+		DiskUsed:        "195G",
+	}
+	args := Args{Width: 300, StatusBG: "black", Compact: true}
+	out := Render(args, m)
+
+	// In compact mode, ONLY CPU, pressure, and real free mem must be present.
+	if !strings.Contains(out, "\uf4bc 25%") {
+		t.Fatalf("compact: missing CPU: %q", out)
+	}
+	if !strings.Contains(out, "\uf080 35%") {
+		t.Fatalf("compact: missing pressure: %q", out)
+	}
+	if !strings.Contains(out, "\uf2db 1.1G") {
+		t.Fatalf("compact: missing real free mem: %q", out)
+	}
+	// Banned in compact mode:
+	for _, unwanted := range []string{"L1", "2.8", "780", "3.3G", "950M", "195G"} {
+		if strings.Contains(out, unwanted) {
+			t.Fatalf("compact: must not contain %q: %q", unwanted, out)
+		}
+	}
+}

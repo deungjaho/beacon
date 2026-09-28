@@ -1370,3 +1370,35 @@ func TestHookSanitizesMarkdownSummary(t *testing.T) {
 		t.Fatalf("hook stop summary: got %q, want %q", rec.Summary, wantSummary)
 	}
 }
+
+func TestCLIStatusTmuxCompactMode(t *testing.T) {
+	te := newTestEnv(t)
+	te.run("reset")
+	snapshot := `{"sampled_at":1000,"cpu_percent":45,"cpu_ok":true,"mem_pressure":40,"mem_pressure_ok":true,"real_free_mem":"1.5G","real_free_mem_ok":true,"pane_mem":{"%1":"100M"}}`
+	os.MkdirAll(te.cacheDir, 0o700)
+	os.WriteFile(filepath.Join(te.cacheDir, "snapshot.json"), []byte(snapshot), 0o600)
+
+	out, _ := te.runWithEnv(map[string]string{
+		"BEACON_SHOW_SYSTEM": "0",
+	}, "status-tmux", "--compact", "200", "black", "test-session", "1", "%1", "@1")
+	assertContains(t, out, "45%", "CPU in compact mode")
+	assertContains(t, out, "40%", "pressure in compact mode")
+	assertContains(t, out, "1.5G", "free mem in compact mode")
+	assertNotContains(t, out, "100M", "pane mem should be excluded in compact mode")
+}
+
+func TestCLIDashboardOnce(t *testing.T) {
+	te := newTestEnv(t)
+	te.run("reset")
+	snapshot := `{"sampled_at":1000,"cpu_percent":45,"cpu_ok":true,"mem_pressure":40,"mem_pressure_ok":true,"real_free_mem":"1.5G","real_free_mem_ok":true}`
+	os.MkdirAll(te.cacheDir, 0o700)
+	os.WriteFile(filepath.Join(te.cacheDir, "snapshot.json"), []byte(snapshot), 0o600)
+
+	out, code := te.run("dashboard", "--once")
+	if code != 0 {
+		t.Fatalf("dashboard --once returned code %d", code)
+	}
+	assertContains(t, out, "Beacon System Monitor", "dashboard title")
+	assertContains(t, out, "45.0%", "CPU in dashboard")
+	assertContains(t, out, "1.5G", "free mem in dashboard")
+}

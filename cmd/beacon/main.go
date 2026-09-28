@@ -8,16 +8,19 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/deungjaho/beacon/internal/agents"
 	"github.com/deungjaho/beacon/internal/collector"
 	"github.com/deungjaho/beacon/internal/daemon"
+	"github.com/deungjaho/beacon/internal/dashboard"
 	"github.com/deungjaho/beacon/internal/pantheon"
 	"github.com/deungjaho/beacon/internal/render"
 	"github.com/deungjaho/beacon/internal/state"
@@ -99,6 +102,7 @@ commands:
   hook <prompt|stop|notification|permission>
   daemon [start|stop|status]  manage background sampler
   agents [--json]         list discovered agent sessions across panes
+  dashboard [--once]      interactive system status monitor
   doctor                  validate local dependencies and state
 `)
 }
@@ -119,6 +123,8 @@ func main() {
 		os.Exit(cmdStatus(args))
 	case "status-tmux":
 		os.Exit(cmdStatusTmux(args))
+	case "dashboard":
+		os.Exit(cmdDashboard(args))
 	case "jump":
 		os.Exit(cmdJump(args))
 	case "acknowledge":
@@ -301,7 +307,7 @@ func cmdStatus(args []string) int {
 }
 
 func cmdStatusTmux(args []string) int {
-	// Args: width status_bg session_name window_index pane_id window_id
+	// Args: [flags...] width status_bg session_name window_index pane_id window_id
 	rargs := render.Args{
 		Width:       100,
 		StatusBG:    "black",
@@ -309,24 +315,41 @@ func cmdStatusTmux(args []string) int {
 		WindowIndex: "",
 		PaneID:      "",
 		WindowID:    "",
+		Compact:     os.Getenv("BEACON_COMPACT_STATUS") == "1",
 	}
-	if len(args) > 0 {
-		rargs.Width, _ = strconv.Atoi(strings.TrimSpace(args[0]))
+
+	var posArgs []string
+	for _, a := range args {
+		switch a {
+		case "--full", "-f":
+			rargs.Compact = false
+		case "--compact", "-c":
+			rargs.Compact = true
+		default:
+			posArgs = append(posArgs, a)
+		}
 	}
-	if len(args) > 1 {
-		rargs.StatusBG = strings.TrimSpace(args[1])
+	if os.Getenv("BEACON_STATUS_ALL") == "1" || os.Getenv("BEACON_COMPACT_STATUS") == "0" {
+		rargs.Compact = false
 	}
-	if len(args) > 2 {
-		rargs.SessionName = strings.TrimSpace(args[2])
+
+	if len(posArgs) > 0 {
+		rargs.Width, _ = strconv.Atoi(strings.TrimSpace(posArgs[0]))
 	}
-	if len(args) > 3 {
-		rargs.WindowIndex = strings.TrimSpace(args[3])
+	if len(posArgs) > 1 {
+		rargs.StatusBG = strings.TrimSpace(posArgs[1])
 	}
-	if len(args) > 4 {
-		rargs.PaneID = strings.TrimSpace(args[4])
+	if len(posArgs) > 2 {
+		rargs.SessionName = strings.TrimSpace(posArgs[2])
 	}
-	if len(args) > 5 {
-		rargs.WindowID = strings.TrimSpace(args[5])
+	if len(posArgs) > 3 {
+		rargs.WindowIndex = strings.TrimSpace(posArgs[3])
+	}
+	if len(posArgs) > 4 {
+		rargs.PaneID = strings.TrimSpace(posArgs[4])
+	}
+	if len(posArgs) > 5 {
+		rargs.WindowID = strings.TrimSpace(posArgs[5])
 	}
 
 	// Read metrics snapshot (fast file read, no subprocess).
@@ -341,6 +364,125 @@ func cmdStatusTmux(args []string) int {
 		fmt.Print(output)
 	}
 	return 0
+}
+
+func isTerminal(f *os.File) bool {
+	stat, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return (stat.Mode() & os.ModeCharDevice) != 0
+}
+
+func setupRawTerminal() (func(), error) {
+	out, err := exec.Command("stty", "-g").Output()
+	if err != nil {
+		return nil, err
+	}
+	saved := strings.TrimSpace(string(out))
+	cmd := exec.Command("stty", "cbreak", "-echo")
+	cmd.Stdin = os.Stdin
+	if err := cmd.Run(); err != nil {
+		return nil, err
+	}
+	restore := func() {
+		cmdRestore := exec.Command("stty", saved)
+		cmdRestore.Stdin = os.Stdin
+		_ = cmdRestore.Run()
+	}
+	return restore, nil
+}
+
+func cmdDashboard(args []string) int {
+	once := false
+	for _, a := range args {
+		if a == "--once" || a == "-1" {
+			once = true
+		}
+	}
+
+	loadData := func() dashboard.Data {
+		var m collector.Metrics
+		snapshotPath := filepath.Join(defaultCacheDir(), "snapshot.json")
+		if data, err := os.ReadFile(snapshotPath); err == nil {
+			_ = json.Unmarshal(data, &m)
+		}
+		var st *state.State
+		if store, err := state.NewStore(defaultStateDir()); err == nil {
+			st, _ = store.Load()
+		}
+		sock := defaultSocketPath()
+		daemonRunning := daemon.IsRunning(sock)
+		host, _ := os.Hostname()
+
+		return dashboard.Data{
+			Metrics:       m,
+			State:         st,
+			DaemonRunning: daemonRunning,
+			Hostname:      host,
+		}
+	}
+
+	if once || !isTerminal(os.Stdin) || !isTerminal(os.Stdout) {
+		data := loadData()
+		fmt.Print(dashboard.Render(data))
+		return 0
+	}
+
+	restore, err := setupRawTerminal()
+	if err != nil {
+		data := loadData()
+		fmt.Print(dashboard.Render(data))
+		return 0
+	}
+	defer restore()
+
+	// Hide cursor
+	fmt.Print("\033[?25l")
+	defer fmt.Print("\033[?25h\033[0m\n")
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+
+	keyCh := make(chan byte, 8)
+	go func() {
+		buf := make([]byte, 1)
+		for {
+			n, err := os.Stdin.Read(buf)
+			if err != nil || n == 0 {
+				keyCh <- 'q'
+				return
+			}
+			keyCh <- buf[0]
+		}
+	}()
+
+	redraw := func() {
+		data := loadData()
+		content := dashboard.Render(data)
+		fmt.Print("\033[H\033[2J" + content)
+	}
+
+	redraw()
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-sigCh:
+			return 0
+		case b := <-keyCh:
+			switch b {
+			case 'q', 'Q', 27, '\n', '\r', 3: // 27 = Esc, 3 = Ctrl-C
+				return 0
+			case 'r', 'R':
+				redraw()
+			}
+		case <-ticker.C:
+			redraw()
+		}
+	}
 }
 
 // cmdJump jumps to a notification pane. With no argument it jumps to the
