@@ -46,6 +46,24 @@ type Metrics struct {
 	ProcCount     int     `json:"proc_count"`
 	ProcCountOK   bool    `json:"proc_count_ok"`
 
+	// Thermal pressure level (macOS: 0=nominal, 1=moderate, 2=heavy, 3=trapping)
+	ThermalLevel int  `json:"thermal_level"`
+	ThermalOK    bool `json:"thermal_ok"`
+
+	// 1-minute system load average
+	LoadAvg1m float64 `json:"load_avg_1m"`
+	LoadAvgOK bool    `json:"load_avg_ok"`
+
+	// Real free physical memory
+	RealFreeMemKB uint64 `json:"real_free_mem_kb"`
+	RealFreeMem   string `json:"real_free_mem"`
+	RealFreeMemOK bool   `json:"real_free_mem_ok"`
+
+	// Memory compressor usage
+	CompressorMemKB uint64 `json:"compressor_mem_kb"`
+	CompressorMem   string `json:"compressor_mem"`
+	CompressorMemOK bool   `json:"compressor_mem_ok"`
+
 	// --- Footprint tier (10s) ---
 	// Per-pane/window/session/total tmux memory.
 	// macOS: physical footprint from top MEM column.
@@ -118,9 +136,30 @@ type paneMemoryResult struct {
 	Kind       MemoryKind // what the aggregated values represent
 }
 
+// FastResult holds the sampled metrics for the fast tier.
+type FastResult struct {
+	CPU          float64
+	CPUOK        bool
+	Pressure     int
+	PressureOK   bool
+	ProcCount    int
+	ProcCountOK  bool
+	LoadAvg1m    float64
+	LoadAvgOK    bool
+	ThermalLevel int
+	ThermalOK    bool
+	RealFreeKB   uint64
+	RealFreeOK   bool
+	CompressorKB uint64
+	CompressorOK bool
+}
+
 var cpuUsagePattern = regexp.MustCompile(`CPU usage:\s*([0-9.]+)% user,\s*([0-9.]+)% sys,`)
 var memPressurePattern = regexp.MustCompile(`System-wide memory free percentage:\s*(\d+)%`)
 var procCountPattern = regexp.MustCompile(`Processes:\s*(\d+)\s+total,`)
+var pageSizePattern = regexp.MustCompile(`page size of\s*(\d+)`)
+var pagesFreePattern = regexp.MustCompile(`Pages free:\s*(\d+)`)
+var pagesCompressorPattern = regexp.MustCompile(`Pages used by compressor:\s*(\d+)`)
 
 // commandTimeout is the max wait for any subprocess.
 // iostat -c 2 -w 1 takes ~1s; allow headroom.
@@ -185,44 +224,52 @@ func parseMacOSCPUUsageTotal(output string) (float64, bool) {
 // We locate the "us" column in the column-header line, then parse the
 // last data line at the same index (us) and index+1 (sy).
 func parseMacOSIOStatCPU(output string) (float64, bool) {
+	cpu, ok, _, _ := parseMacOSIOStat(output)
+	return cpu, ok
+}
+
+// parseMacOSIOStat parses iostat -c 2 -w 1 output and returns CPU total and 1m load average.
+func parseMacOSIOStat(output string) (cpu float64, cpuOK bool, load1m float64, loadOK bool) {
 	lines := strings.Split(strings.TrimSpace(output), "\n")
 	if len(lines) < 4 {
-		return 0, false
+		return 0, false, 0, false
 	}
-	// Line 1 is the column header: "KB/t tps MB/s ... us sy id 1m 5m 15m".
 	headerFields := strings.Fields(lines[1])
 	usIdx := -1
+	loadIdx := -1
 	for i, f := range headerFields {
 		if f == "us" {
 			usIdx = i
-			break
+		}
+		if f == "1m" {
+			loadIdx = i
 		}
 	}
-	if usIdx < 0 {
-		return 0, false
-	}
-	// The last line is the second sample.
 	lastLine := strings.TrimSpace(lines[len(lines)-1])
 	fields := strings.Fields(lastLine)
-	if len(fields) < usIdx+2 {
-		return 0, false
+	if usIdx >= 0 && len(fields) >= usIdx+2 {
+		us, err1 := strconv.ParseFloat(fields[usIdx], 64)
+		sy, err2 := strconv.ParseFloat(fields[usIdx+1], 64)
+		if err1 == nil && err2 == nil {
+			total := us + sy
+			if total < 0 {
+				total = 0
+			}
+			if total > 100 {
+				total = 100
+			}
+			cpu = total
+			cpuOK = true
+		}
 	}
-	us, err := strconv.ParseFloat(fields[usIdx], 64)
-	if err != nil {
-		return 0, false
+	if loadIdx >= 0 && len(fields) > loadIdx {
+		l1, err := strconv.ParseFloat(fields[loadIdx], 64)
+		if err == nil {
+			load1m = l1
+			loadOK = true
+		}
 	}
-	sy, err := strconv.ParseFloat(fields[usIdx+1], 64)
-	if err != nil {
-		return 0, false
-	}
-	total := us + sy
-	if total < 0 {
-		total = 0
-	}
-	if total > 100 {
-		total = 100
-	}
-	return total, true
+	return
 }
 
 // parseMacOSMemPressure extracts the free percentage and returns pressure (100 - free).
@@ -243,6 +290,54 @@ func parseMacOSMemPressure(output string) (int, bool) {
 		pressure = 100
 	}
 	return pressure, true
+}
+
+func parseMacOSMemoryPressureDetailed(output string) (pressure int, pressureOK bool, freeKB uint64, freeOK bool, compKB uint64, compOK bool) {
+	pressure, pressureOK = parseMacOSMemPressure(output)
+
+	pageSize := uint64(16384)
+	if m := pageSizePattern.FindStringSubmatch(output); len(m) == 2 {
+		if ps, err := strconv.ParseUint(m[1], 10, 64); err == nil && ps > 0 {
+			pageSize = ps
+		}
+	}
+
+	if m := pagesFreePattern.FindStringSubmatch(output); len(m) == 2 {
+		if pages, err := strconv.ParseUint(m[1], 10, 64); err == nil {
+			freeKB = (pages * pageSize) / 1024
+			freeOK = true
+		}
+	}
+
+	if m := pagesCompressorPattern.FindStringSubmatch(output); len(m) == 2 {
+		if pages, err := strconv.ParseUint(m[1], 10, 64); err == nil {
+			compKB = (pages * pageSize) / 1024
+			compOK = true
+		}
+	}
+	return
+}
+
+func parseMacOSThermalLevel(output string) (int, bool) {
+	fields := strings.Fields(strings.TrimSpace(output))
+	if len(fields) >= 2 && strings.HasPrefix(fields[0], "com.apple.system.thermalpressurelevel") {
+		lvl, err := strconv.Atoi(fields[1])
+		if err == nil {
+			return lvl, true
+		}
+	}
+	return 0, false
+}
+
+func parseLinuxLoadAvg(output string) (float64, bool) {
+	fields := strings.Fields(strings.TrimSpace(output))
+	if len(fields) > 0 {
+		l1, err := strconv.ParseFloat(fields[0], 64)
+		if err == nil {
+			return l1, true
+		}
+	}
+	return 0, false
 }
 
 // parseMacOSProcCount extracts the process count from top's "Processes: N total" line.
@@ -492,6 +587,16 @@ func FormatMemoryMB(kb uint64) string {
 	return formatMemoryMB(kb)
 }
 
+// FormatMemoryCompact formats KB into a compact string with 1 decimal place if in GB (e.g. 1.1G, 3.2G),
+// or whole MB if in MB (e.g. 425M).
+func FormatMemoryCompact(kb uint64) string {
+	mb := float64(kb) / 1024.0
+	if mb >= 1024.0 {
+		return strconv.FormatFloat(mb/1024.0, 'f', 1, 64) + "G"
+	}
+	return strconv.FormatFloat(mb, 'f', 0, 64) + "M"
+}
+
 // formatMemoryMB converts KB to a human-readable string (M or G).
 func formatMemoryMB(kb uint64) string {
 	mb := float64(kb) / 1024.0
@@ -703,10 +808,11 @@ func NewCollector(osName, tmuxBin string) *Collector {
 //   - CPU: /proc/stat (delta from previous sample)
 //   - process count: ps aux
 //   - memory pressure: /proc/meminfo (MemTotal - MemAvailable)
-func (c *Collector) SampleFast() (cpu float64, cpuOK bool, pressure int, pressureOK bool, procCount int, procCountOK bool) {
+func (c *Collector) SampleFast() FastResult {
+	var res FastResult
 	var wg sync.WaitGroup
-	var cpuOut, pressureOut, procOut []byte
-	var cpuErr, pressureErr, procErr error
+	var cpuOut, pressureOut, procOut, thermalOut, loadOut []byte
+	var cpuErr, pressureErr, procErr, thermalErr, loadErr error
 
 	wg.Add(3)
 	go func() {
@@ -721,39 +827,81 @@ func (c *Collector) SampleFast() (cpu float64, cpuOK bool, pressure int, pressur
 		defer wg.Done()
 		procOut, procErr = c.sampleProcCountOutput()
 	}()
+
+	if c.os == "darwin" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			thermalOut, thermalErr = c.sampleThermalOutput()
+		}()
+	} else if c.os == "linux" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			loadOut, loadErr = c.sampleLoadOutput()
+		}()
+	}
 	wg.Wait()
 
-	// Parse CPU.
+	// Parse CPU & Load.
 	if cpuErr == nil {
 		switch c.os {
 		case "darwin":
-			cpu, cpuOK = parseMacOSIOStatCPU(string(cpuOut))
+			res.CPU, res.CPUOK, res.LoadAvg1m, res.LoadAvgOK = parseMacOSIOStat(string(cpuOut))
 		case "linux":
-			cpu, cpuOK = c.parseLinuxCPU(string(cpuOut))
+			res.CPU, res.CPUOK = c.parseLinuxCPU(string(cpuOut))
 		}
 	}
+	if !res.LoadAvgOK && loadErr == nil && c.os == "linux" {
+		res.LoadAvg1m, res.LoadAvgOK = parseLinuxLoadAvg(string(loadOut))
+	}
 
-	// Parse memory pressure.
+	// Parse memory pressure, real free, and compressor.
 	if pressureErr == nil {
 		switch c.os {
 		case "darwin":
-			pressure, pressureOK = parseMacOSMemPressure(string(pressureOut))
+			res.Pressure, res.PressureOK, res.RealFreeKB, res.RealFreeOK, res.CompressorKB, res.CompressorOK = parseMacOSMemoryPressureDetailed(string(pressureOut))
 		case "linux":
 			total, avail, ok := parseLinuxMemInfo(string(pressureOut))
 			if ok {
-				pressure = linuxMemPressurePercent(total, avail)
-				pressureOK = true
+				res.Pressure = linuxMemPressurePercent(total, avail)
+				res.PressureOK = true
+				res.RealFreeKB = avail
+				res.RealFreeOK = true
 			}
 		}
 	}
 
 	// Parse process count.
 	if procErr == nil {
-		procCount = parseProcCount(string(procOut))
-		procCountOK = true
+		res.ProcCount = parseProcCount(string(procOut))
+		res.ProcCountOK = true
 	}
 
-	return
+	// Parse thermal.
+	if thermalErr == nil && c.os == "darwin" {
+		res.ThermalLevel, res.ThermalOK = parseMacOSThermalLevel(string(thermalOut))
+	}
+
+	return res
+}
+
+func (c *Collector) sampleThermalOutput() ([]byte, error) {
+	switch c.os {
+	case "darwin":
+		return runCommand("notifyutil", "-g", "com.apple.system.thermalpressurelevel")
+	case "linux":
+		return runCommand("cat", "/sys/class/thermal/thermal_zone0/temp")
+	}
+	return nil, exec.ErrNotFound
+}
+
+func (c *Collector) sampleLoadOutput() ([]byte, error) {
+	switch c.os {
+	case "linux":
+		return runCommand("cat", "/proc/loadavg")
+	}
+	return nil, exec.ErrNotFound
 }
 
 // sampleCPUOutput returns raw CPU output for parsing.

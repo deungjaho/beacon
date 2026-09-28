@@ -199,11 +199,11 @@ func (d *Daemon) Stop() {
 	<-d.done
 }
 
-// sampleFast collects fast-tier metrics (CPU, pressure, proc count).
+// sampleFast collects fast-tier metrics (CPU, thermal, load, pressure, free mem, compressor, proc count).
 // Does NOT scan the full process list. Retains last-good footprint/slow
 // values and marks them stale if they are older than their cadence.
 func (d *Daemon) sampleFast() {
-	cpu, cpuOK, pressure, pressureOK, procCount, procCountOK := d.collector.SampleFast()
+	res := d.collector.SampleFast()
 	now := time.Now().Unix()
 
 	d.mu.Lock()
@@ -211,21 +211,39 @@ func (d *Daemon) sampleFast() {
 	m.SampledAt = now
 
 	// Fast tier: update or mark stale.
-	if cpuOK {
-		m.CPUPercent = cpu
+	if res.CPUOK {
+		m.CPUPercent = res.CPU
 		m.CPUOK = true
 		m.CPUSampledAt = now
 		m.CPUStale = false
 	} else {
 		m.CPUStale = true
 	}
-	if pressureOK {
-		m.MemPressure = pressure
+	if res.PressureOK {
+		m.MemPressure = res.Pressure
 		m.MemPressureOK = true
 	}
-	if procCountOK {
-		m.ProcCount = procCount
+	if res.ProcCountOK {
+		m.ProcCount = res.ProcCount
 		m.ProcCountOK = true
+	}
+	if res.LoadAvgOK {
+		m.LoadAvg1m = res.LoadAvg1m
+		m.LoadAvgOK = true
+	}
+	if res.ThermalOK {
+		m.ThermalLevel = res.ThermalLevel
+		m.ThermalOK = true
+	}
+	if res.RealFreeOK {
+		m.RealFreeMemKB = res.RealFreeKB
+		m.RealFreeMem = collector.FormatMemoryCompact(res.RealFreeKB)
+		m.RealFreeMemOK = true
+	}
+	if res.CompressorOK {
+		m.CompressorMemKB = res.CompressorKB
+		m.CompressorMem = collector.FormatMemoryCompact(res.CompressorKB)
+		m.CompressorMemOK = true
 	}
 
 	// Mark footprint/slow stale if they haven't been sampled yet or are old.

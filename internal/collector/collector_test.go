@@ -632,18 +632,99 @@ func TestSampleFastTimeoutRetainsLastGood(t *testing.T) {
 	// Override sampleCPUOutput to simulate timeout by using a bad command.
 	// We can't easily inject, but we can verify that a real SampleFast
 	// on darwin returns valid values (smoke test).
-	cpu, cpuOK, _, pressureOK, _, procCountOK := c.SampleFast()
-	if !cpuOK {
-		t.Fatalf("CPU should be OK on darwin: cpu=%.1f", cpu)
+	res := c.SampleFast()
+	if !res.CPUOK {
+		t.Fatalf("CPU should be OK on darwin: cpu=%.1f", res.CPU)
 	}
-	if !pressureOK {
+	if !res.PressureOK {
 		t.Fatalf("pressure should be OK on darwin")
 	}
-	if !procCountOK {
+	if !res.ProcCountOK {
 		t.Fatalf("proc count should be OK on darwin")
 	}
-	if cpu < 0 || cpu > 100 {
-		t.Fatalf("CPU out of range: %.1f", cpu)
+	if res.CPU < 0 || res.CPU > 100 {
+		t.Fatalf("CPU out of range: %.1f", res.CPU)
+	}
+}
+
+func TestParseMacOSIOStat(t *testing.T) {
+	input := `
+              disk0       cpu    load average
+    KB/t  tps  MB/s  us sy id   1m   5m   15m
+   26.54  762 19.76  20 11 69  3.04 3.82 6.74
+    4.00    8  0.03  15 13 72  3.04 3.82 6.74
+`
+	cpu, cpuOK, load, loadOK := parseMacOSIOStat(input)
+	if !cpuOK || cpu != 28.0 {
+		t.Fatalf("cpu: got %.1f, ok=%v, want 28.0, true", cpu, cpuOK)
+	}
+	if !loadOK || load != 3.04 {
+		t.Fatalf("load: got %.2f, ok=%v, want 3.04, true", load, loadOK)
+	}
+}
+
+func TestParseMacOSThermalLevel(t *testing.T) {
+	tests := []struct {
+		input   string
+		wantLvl int
+		wantOK  bool
+	}{
+		{"com.apple.system.thermalpressurelevel 0", 0, true},
+		{"com.apple.system.thermalpressurelevel 1", 1, true},
+		{"com.apple.system.thermalpressurelevel 2\n", 2, true},
+		{"invalid", 0, false},
+	}
+	for _, tc := range tests {
+		lvl, ok := parseMacOSThermalLevel(tc.input)
+		if ok != tc.wantOK || lvl != tc.wantLvl {
+			t.Fatalf("parseMacOSThermalLevel(%q): got (%d, %v), want (%d, %v)", tc.input, lvl, ok, tc.wantLvl, tc.wantOK)
+		}
+	}
+}
+
+func TestParseMacOSMemoryPressureDetailed(t *testing.T) {
+	input := `The system has 17179869184 (1048576 pages with a page size of 16384).
+
+Stats: 
+Pages free: 27192 
+Pages purgeable: 14228 
+Pages purged: 169379 
+
+Compressor Stats:
+Pages used by compressor: 206567 
+Pages decompressed: 900204 
+Pages compressed: 1792912 
+
+System-wide memory free percentage: 62%
+`
+	pressure, pressOK, freeKB, freeOK, compKB, compOK := parseMacOSMemoryPressureDetailed(input)
+	if !pressOK || pressure != 38 {
+		t.Fatalf("pressure: got %d, want 38", pressure)
+	}
+	if !freeOK || freeKB != 435072 {
+		t.Fatalf("freeKB: got %d, want 435072", freeKB)
+	}
+	if !compOK || compKB != 3305072 {
+		t.Fatalf("compKB: got %d, want 3305072", compKB)
+	}
+}
+
+func TestFormatMemoryCompact(t *testing.T) {
+	tests := []struct {
+		kb   uint64
+		want string
+	}{
+		{435072, "425M"},
+		{3305072, "3.2G"},
+		{1024 * 1024, "1.0G"},
+		{1126400, "1.1G"},
+		{500 * 1024, "500M"},
+	}
+	for _, tc := range tests {
+		got := FormatMemoryCompact(tc.kb)
+		if got != tc.want {
+			t.Fatalf("FormatMemoryCompact(%d): got %q, want %q", tc.kb, got, tc.want)
+		}
 	}
 }
 

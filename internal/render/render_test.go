@@ -680,3 +680,33 @@ func TestRenderPowerlineSeparatorBetweenTotalMemAndDisk(t *testing.T) {
 	boundary = append(boundary, []byte("#[fg=#1d1f21,bg=#DFAF8F")...)
 	assertBytesIn(t, "separator-totalmem-to-disk", out, boundary)
 }
+
+func TestRenderNewResourceMetrics(t *testing.T) {
+	m := collector.Metrics{
+		ThermalOK:       true,
+		ThermalLevel:    1,
+		LoadAvgOK:       true,
+		LoadAvg1m:       3.2,
+		RealFreeMemOK:   true,
+		RealFreeMem:     "1.1G",
+		RealFreeMemKB:   1100 * 1024,
+		CompressorMemOK: true,
+		CompressorMem:   "3.3G",
+		CompressorMemKB: 3300 * 1024,
+	}
+	args := Args{Width: 300, StatusBG: "black"}
+	out := Render(args, m)
+
+	if !strings.Contains(out, "\uf2c9 L1") {
+		t.Fatalf("missing thermal level: %q", out)
+	}
+	if !strings.Contains(out, "\uf0e4 3.2") {
+		t.Fatalf("missing load avg: %q", out)
+	}
+	if !strings.Contains(out, "\uf2db 1.1G") {
+		t.Fatalf("missing real free mem: %q", out)
+	}
+	if !strings.Contains(out, "\U000F061A 3.3G") {
+		t.Fatalf("missing compressor mem: %q", out)
+	}
+}

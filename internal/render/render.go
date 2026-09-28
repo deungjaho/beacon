@@ -41,12 +41,16 @@ type Segment struct {
 
 const (
 	iconCPU         = "\uf4bc"
+	iconThermal     = "\uf2c9"
+	iconLoad        = "\uf0e4"
 	iconPaneMem     = "\ue266"
 	iconWindowMem   = "\U000F05B2"
 	iconSessionMem  = "\uebc8"
 	iconTotalMem    = "\U000F035B"
 	iconProcCount   = "\uf46c"
 	iconMemPressure = "\uf080"
+	iconFreeMem     = "\uf2db"
+	iconCompressor  = "\U000F061A"
 	iconDisk        = "\uf0a0" // disk icon (U+F0A0)
 )
 
@@ -67,8 +71,9 @@ func Render(args Args, m collector.Metrics) string {
 }
 
 // buildSegments builds resource-only segments in strict order:
-// CPU, memory pressure, process count, pane memory, window memory,
-// session memory, total tmux memory, root disk usage.
+// CPU, thermal, load, memory pressure, real free memory, compressor,
+// process count, pane memory, window memory, session memory, total tmux memory,
+// root disk usage.
 func buildSegments(args Args, m collector.Metrics) []Segment {
 	var segs []Segment
 
@@ -82,7 +87,27 @@ func buildSegments(args Args, m collector.Metrics) []Segment {
 		})
 	}
 
-	// 2. Memory pressure
+	// 2. Thermal pressure level
+	if m.ThermalOK {
+		segs = append(segs, Segment{
+			FG:   "#1d1f21",
+			BG:   thermalBGColor(m.ThermalLevel),
+			Text: fmt.Sprintf("%s L%d", iconThermal, m.ThermalLevel),
+			Bold: m.ThermalLevel > 0,
+		})
+	}
+
+	// 3. System Load average (1m)
+	if m.LoadAvgOK {
+		segs = append(segs, Segment{
+			FG:   "#1d1f21",
+			BG:   loadAvgBGColor(m.LoadAvg1m),
+			Text: fmt.Sprintf("%s %.1f", iconLoad, m.LoadAvg1m),
+			Bold: m.LoadAvg1m >= 10.0,
+		})
+	}
+
+	// 4. Memory pressure
 	if m.MemPressureOK {
 		segs = append(segs, Segment{
 			FG:   "#1d1f21",
@@ -92,7 +117,27 @@ func buildSegments(args Args, m collector.Metrics) []Segment {
 		})
 	}
 
-	// 3. Process count
+	// 5. Real free physical memory
+	if m.RealFreeMemOK && m.RealFreeMem != "" {
+		segs = append(segs, Segment{
+			FG:   "#1d1f21",
+			BG:   realFreeBGColor(m.RealFreeMemKB),
+			Text: fmt.Sprintf("%s %s", iconFreeMem, m.RealFreeMem),
+			Bold: m.RealFreeMemKB < 512*1024,
+		})
+	}
+
+	// 6. Memory compressor usage
+	if m.CompressorMemOK && m.CompressorMem != "" {
+		segs = append(segs, Segment{
+			FG:   "#1d1f21",
+			BG:   compressorBGColor(m.CompressorMemKB),
+			Text: fmt.Sprintf("%s %s", iconCompressor, m.CompressorMem),
+			Bold: m.CompressorMemKB >= 4*1024*1024,
+		})
+	}
+
+	// 7. Process count
 	if m.ProcCountOK {
 		segs = append(segs, Segment{
 			FG:   "#1d1f21",
@@ -169,6 +214,54 @@ func diskBGColor(availableKB uint64) string {
 		return "#CC9393"
 	}
 	return "#DFAF8F"
+}
+
+func thermalBGColor(level int) string {
+	switch {
+	case level <= 0:
+		return "#7F9F7F"
+	case level == 1:
+		return "#F0DFAF"
+	case level == 2:
+		return "#CC9393"
+	default:
+		return "#DCA3A3"
+	}
+}
+
+func loadAvgBGColor(load float64) string {
+	switch {
+	case load < 4.0:
+		return "#7F9F7F"
+	case load < 10.0:
+		return "#F0DFAF"
+	default:
+		return "#CC9393"
+	}
+}
+
+func realFreeBGColor(freeKB uint64) string {
+	const giB = uint64(1024 * 1024)
+	switch {
+	case freeKB >= giB:
+		return "#5A8A8A"
+	case freeKB >= giB/2:
+		return "#DFAF8F"
+	default:
+		return "#CC9393"
+	}
+}
+
+func compressorBGColor(compKB uint64) string {
+	const giB = uint64(1024 * 1024)
+	switch {
+	case compKB < 2*giB:
+		return "#4A7A7A"
+	case compKB < 4*giB:
+		return "#DFAF8F"
+	default:
+		return "#CC9393"
+	}
 }
 
 func formatPowerline(statusBG string, segs []Segment) string {
