@@ -98,6 +98,10 @@ commands:
   acknowledge-visible     clear bells for all panes visible to attached clients
   sync-bells             sync tmux user options from Beacon state
   cleanup                 remove expired or dead-pane records
+  register <type> <id> [--pane %N] [--data JSON] [--producer name]
+  unregister <type> <id>
+  resources [--type t] [--pane %N] [--stale] [--json]
+  tabs [--json] [--count] [--stale]   list agent browser tabs
   reset                   clear local Beacon state
   hook <prompt|stop|notification|permission>
   daemon [start|stop|status]  manage background sampler
@@ -149,6 +153,8 @@ func main() {
 		os.Exit(cmdUnregister(args))
 	case "resources":
 		os.Exit(cmdResources(args))
+	case "tabs":
+		os.Exit(cmdTabs(args))
 	case "doctor":
 		os.Exit(cmdDoctor(args))
 	case "-h", "--help", "help":
@@ -537,6 +543,11 @@ func cmdJump(args []string) int {
 	if err != nil {
 		return 0
 	}
+	// `beacon jump --tab <id>`: activate the browser tab via its producer
+	// (argus owns CDP); fall back to landing on the owning agent pane.
+	if len(args) >= 2 && args[0] == "--tab" {
+		return jumpToTab(store, args[1])
+	}
 	// If a pane ID argument is given, jump directly to that pane.
 	if len(args) > 0 {
 		pane := args[0]
@@ -563,6 +574,93 @@ func cmdJump(args []string) int {
 		return 0
 	}
 	return 0
+}
+
+// cmdTabs lists browser tab resources owned by panes:
+// beacon tabs [--json] [--count] [--stale]
+func cmdTabs(args []string) int {
+	asJSON, countOnly, staleOnly := false, false, false
+	for _, a := range args {
+		switch a {
+		case "--json":
+			asJSON = true
+		case "--count":
+			countOnly = true
+		case "--stale":
+			staleOnly = true
+		}
+	}
+	reg, err := state.NewRegistryStore(defaultStateDir())
+	if err != nil {
+		return 1
+	}
+	recs := reg.List("tab", "", staleOnly)
+	if countOnly {
+		fmt.Println(len(recs))
+		return 0
+	}
+	if asJSON {
+		out, _ := json.Marshal(recs)
+		fmt.Println(string(out))
+		return 0
+	}
+	if len(recs) == 0 {
+		fmt.Println("no agent tabs")
+		return 0
+	}
+	now := nowSeconds()
+	for _, r := range recs {
+		title, _ := r.Metadata["title"].(string)
+		u, _ := r.Metadata["url"].(string)
+		label := title
+		if label == "" {
+			label = u
+		} else if u != "" {
+			label += "  " + u
+		}
+		staleMark := ""
+		if r.Stale {
+			staleMark = " [stale]"
+		}
+		fmt.Printf("%-40s pane=%-4s age=%-5ds %s%s\n",
+			r.ID, r.OwnerPane, now-r.CreatedAt, label, staleMark)
+	}
+	return 0
+}
+
+// jumpToTab activates a browser tab through its producer's activation CLI
+// (argus owns CDP). If the producer is unavailable or activation fails,
+// fall back to jumping to the owning pane so the user still lands somewhere
+// relevant.
+func jumpToTab(store *state.Store, tabID string) int {
+	reg, err := state.NewRegistryStore(defaultStateDir())
+	if err != nil {
+		return 1
+	}
+	var rec *state.ResourceRecord
+	for _, r := range reg.List("tab", "", false) {
+		if r.ID == tabID {
+			c := r
+			rec = &c
+			break
+		}
+	}
+	if rec == nil {
+		fmt.Fprintf(os.Stderr, "beacon: no registered tab %q\n", tabID)
+		return 1
+	}
+	if argus, err := exec.LookPath("argus"); err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if exec.CommandContext(ctx, argus, "activate", tabID).Run() == nil {
+			return 0
+		}
+	}
+	if rec.OwnerPane != "" && paneIDPattern.MatchString(rec.OwnerPane) {
+		return jumpToPane(store, rec.OwnerPane)
+	}
+	fmt.Fprintf(os.Stderr, "beacon: tab %s activation failed and owner pane %q is gone\n", tabID, rec.OwnerPane)
+	return 1
 }
 
 // jumpToPane queries the live pane's session and window from live tmux,
