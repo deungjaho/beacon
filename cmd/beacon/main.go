@@ -577,9 +577,11 @@ func cmdJump(args []string) int {
 }
 
 // cmdTabs lists browser tab resources owned by panes:
-// beacon tabs [--json] [--count] [--stale]
+// beacon tabs [--json] [--count] [--stale] [--pick]
+// --pick opens an interactive selector (fzf when present, else a numbered
+// prompt on /dev/tty) and jumps to the chosen tab — the tmux popup entry point.
 func cmdTabs(args []string) int {
-	asJSON, countOnly, staleOnly := false, false, false
+	asJSON, countOnly, staleOnly, pick := false, false, false, false
 	for _, a := range args {
 		switch a {
 		case "--json":
@@ -588,6 +590,8 @@ func cmdTabs(args []string) int {
 			countOnly = true
 		case "--stale":
 			staleOnly = true
+		case "--pick":
+			pick = true
 		}
 	}
 	reg, err := state.NewRegistryStore(defaultStateDir())
@@ -595,6 +599,13 @@ func cmdTabs(args []string) int {
 		return 1
 	}
 	recs := reg.List("tab", "", staleOnly)
+	if pick {
+		store, err := state.NewStore(defaultStateDir())
+		if err != nil {
+			return 1
+		}
+		return pickTab(store, recs)
+	}
 	if countOnly {
 		fmt.Println(len(recs))
 		return 0
@@ -626,6 +637,50 @@ func cmdTabs(args []string) int {
 			r.ID, r.OwnerPane, now-r.CreatedAt, label, staleMark)
 	}
 	return 0
+}
+
+// pickTab is the tmux-popup selector: fzf when available, else a numbered
+// prompt. Selection jumps through the producer's activation path.
+func pickTab(store *state.Store, recs []state.ResourceRecord) int {
+	if len(recs) == 0 {
+		fmt.Println("no agent tabs")
+		return 0
+	}
+	now := nowSeconds()
+	labels := make([]string, len(recs))
+	for i, r := range recs {
+		title, _ := r.Metadata["title"].(string)
+		u, _ := r.Metadata["url"].(string)
+		label := title
+		if label == "" {
+			label = u
+		} else if u != "" {
+			label += "  " + u
+		}
+		labels[i] = fmt.Sprintf("%s\tpane=%s age=%ds %s", r.ID, r.OwnerPane, now-r.CreatedAt, label)
+	}
+
+	var pickedID string
+	if fzf, err := exec.LookPath("fzf"); err == nil {
+		cmd := exec.Command(fzf, "--with-nth=2..", "--header=agent tabs — enter to jump")
+		cmd.Stdin = strings.NewReader(strings.Join(labels, "\n") + "\n")
+		out, err := cmd.Output()
+		if err != nil {
+			return 0 // cancelled
+		}
+		pickedID = strings.Fields(string(out))[0]
+	} else {
+		for i, l := range labels {
+			fmt.Printf("%2d) %s\n", i+1, l)
+		}
+		fmt.Print("jump to # ")
+		var n int
+		if _, err := fmt.Scan(&n); err != nil || n < 1 || n > len(recs) {
+			return 0
+		}
+		pickedID = recs[n-1].ID
+	}
+	return jumpToTab(store, pickedID)
 }
 
 // jumpToTab activates a browser tab through its producer's activation CLI
