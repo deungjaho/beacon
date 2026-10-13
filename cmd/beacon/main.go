@@ -751,7 +751,10 @@ func jumpToTab(store *state.Store, tabID string) int {
 	if argus, err := exec.LookPath("argus"); err == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if exec.CommandContext(ctx, argus, "activate", tabID).Run() == nil {
+		// Require the success marker — an argus binary that predates the
+		// activate subcommand exits 0 without doing anything.
+		out, err := exec.CommandContext(ctx, argus, "activate", tabID).Output()
+		if err == nil && strings.Contains(string(out), "activated "+tabID) {
 			return 0
 		}
 	}
