@@ -586,7 +586,7 @@ func TestRenderAllSegmentsTogether(t *testing.T) {
 }
 
 func TestRenderDiskSegment(t *testing.T) {
-	m := collector.Metrics{DiskOK: true, DiskUsed: "12G", DiskTotal: "228G", DiskAvailableKB: 8 * 1024 * 1024}
+	m := collector.Metrics{DiskOK: true, DiskUsed: "12G", DiskTotal: "228G", DiskAvailableKB: 30 * 1024 * 1024}
 	args := Args{Width: 200, StatusBG: "black", PaneID: "%1", WindowID: "@1", SessionName: "s", WindowIndex: "1"}
 	out := Render(args, m)
 	// status-right shows only used, not /total.
@@ -609,18 +609,22 @@ func TestRenderDiskSegment(t *testing.T) {
 }
 
 func TestDiskBGColor(t *testing.T) {
-	// 5 GiB = 5 * 1024 * 1024 KB
+	// 5 GiB = 5 * 1024 * 1024 KB; warn boundary is 20 GiB.
 	const giB5 = uint64(5 * 1024 * 1024)
+	const giB20 = uint64(20 * 1024 * 1024)
 	tests := []struct {
 		name        string
 		availableKB uint64
 		want        string
 	}{
 		{"5GiB-1 red", giB5 - 1, "#CC9393"},
-		{"exactly 5GiB brown", giB5, "#DFAF8F"},
-		{"above 5GiB brown", giB5 + 1, "#DFAF8F"},
+		{"exactly 5GiB yellow", giB5, "#F0DFAF"},
+		{"above 5GiB yellow", giB5 + 1, "#F0DFAF"},
 		{"0 red", 0, "#CC9393"},
-		{"8.5GiB brown (typical)", 8*1024*1024 + 512*1024, "#DFAF8F"},
+		{"8.5GiB yellow", 8*1024*1024 + 512*1024, "#F0DFAF"},
+		{"19GiB yellow", 19 * 1024 * 1024, "#F0DFAF"},
+		{"exactly 20GiB brown", giB20, "#DFAF8F"},
+		{"30GiB brown", 30 * 1024 * 1024, "#DFAF8F"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -640,7 +644,8 @@ func TestRenderDiskSegmentColorByAvailable(t *testing.T) {
 		wantBG  string
 	}{
 		{"low available → red", 4 * 1024 * 1024, "#CC9393"},
-		{"sufficient available → brown", 8 * 1024 * 1024, "#DFAF8F"},
+		{"medium available → yellow", 8 * 1024 * 1024, "#F0DFAF"},
+		{"sufficient available → brown", 30 * 1024 * 1024, "#DFAF8F"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -675,9 +680,9 @@ func TestRenderPowerlineSeparatorBetweenTotalMemAndDisk(t *testing.T) {
 	out := []byte(Render(args, m))
 
 	sep := exactBytes('\uE0B2')
-	boundary := []byte("#DFAF8F,bg=#3A6A6A]")
+	boundary := []byte("#F0DFAF,bg=#3A6A6A]")
 	boundary = append(boundary, sep...)
-	boundary = append(boundary, []byte("#[fg=#1d1f21,bg=#DFAF8F")...)
+	boundary = append(boundary, []byte("#[fg=#1d1f21,bg=#F0DFAF")...)
 	assertBytesIn(t, "separator-totalmem-to-disk", out, boundary)
 }
 
@@ -737,33 +742,51 @@ func TestRenderCompactMode(t *testing.T) {
 	args := Args{Width: 300, StatusBG: "black", Compact: true}
 	out := Render(args, m)
 
-	// In compact mode, the 7 host metrics must be present.
-	if !strings.Contains(out, "\uf4bc 25%") {
-		t.Fatalf("compact: missing CPU: %q", out)
+	// Compact keeps only: CPU, load, memory pressure, compressor.
+	for _, want := range []string{"\uf4bc 25%", "2.8", "\uf080 35%", "3.3G"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("compact: missing %q: %q", want, out)
+		}
 	}
-	if !strings.Contains(out, "L1") {
-		t.Fatalf("compact: missing thermal: %q", out)
-	}
-	if !strings.Contains(out, "2.8") {
-		t.Fatalf("compact: missing load avg: %q", out)
-	}
-	if !strings.Contains(out, "\uf080 35%") {
-		t.Fatalf("compact: missing pressure: %q", out)
-	}
-	if !strings.Contains(out, "\uf2db 1.1G") {
-		t.Fatalf("compact: missing real free mem: %q", out)
-	}
-	if !strings.Contains(out, "3.3G") {
-		t.Fatalf("compact: missing compressor: %q", out)
-	}
-	if !strings.Contains(out, "4200") {
-		t.Fatalf("compact: missing thread count: %q", out)
+	// Thermal, real-free-mem and proc/thread counts are full-mode only.
+	for _, unwanted := range []string{"L1", "1.1G", "780", "4200"} {
+		if strings.Contains(out, unwanted) {
+			t.Fatalf("compact: must not contain %q: %q", unwanted, out)
+		}
 	}
 
 	// Banned in compact mode: tmux memory hierarchy and disk
 	for _, unwanted := range []string{"950M", "195G"} {
 		if strings.Contains(out, unwanted) {
 			t.Fatalf("compact: must not contain %q: %q", unwanted, out)
+		}
+	}
+}
+
+func TestRenderCompactWithTmuxMem(t *testing.T) {
+	m := collector.Metrics{
+		ProcCount:   780,
+		ProcCountOK: true,
+		PaneMem:     map[string]string{"%1": "364M"},
+		WindowMem:   map[string]string{"s:1": "600M"},
+		SessionMem:  map[string]string{"s": "1.5G"},
+		TotalMem:    "2G",
+		DiskOK:      true,
+		DiskUsed:    "195G",
+	}
+	args := Args{Width: 300, StatusBG: "black", Compact: true, WithTmuxMem: true,
+		PaneID: "%1", WindowID: "@1", SessionName: "s", WindowIndex: "1"}
+	out := Render(args, m)
+
+	for _, want := range []string{"364M", "600M", "1.5G"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("compact+tmux-mem: missing %q: %q", want, out)
+		}
+	}
+	// Total tmux mem and disk remain compact-only-excluded.
+	for _, unwanted := range []string{"2G", "195G"} {
+		if strings.Contains(out, unwanted) {
+			t.Fatalf("compact+tmux-mem: must not contain %q: %q", unwanted, out)
 		}
 	}
 }

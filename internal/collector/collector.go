@@ -23,7 +23,10 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"path"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -52,9 +55,11 @@ type Metrics struct {
 	ThermalLevel int  `json:"thermal_level"`
 	ThermalOK    bool `json:"thermal_ok"`
 
-	// 1-minute system load average
-	LoadAvg1m float64 `json:"load_avg_1m"`
-	LoadAvgOK bool    `json:"load_avg_ok"`
+	// System load averages (5m/15m available on macOS/Linux)
+	LoadAvg1m  float64 `json:"load_avg_1m"`
+	LoadAvg5m  float64 `json:"load_avg_5m,omitempty"`
+	LoadAvg15m float64 `json:"load_avg_15m,omitempty"`
+	LoadAvgOK  bool    `json:"load_avg_ok"`
 
 	// Real free physical memory
 	RealFreeMemKB uint64 `json:"real_free_mem_kb"`
@@ -94,6 +99,87 @@ type Metrics struct {
 	DiskStale       bool   `json:"disk_stale"`
 	DiskUsed        string `json:"disk_used"`
 	DiskTotal       string `json:"disk_total"`
+
+	// --- Fast tier extras ---
+	// Top processes by CPU / by memory (up to 5 each).
+	TopCPUProcs []ProcStat `json:"top_cpu_procs,omitempty"`
+	TopMemProcs []ProcStat `json:"top_mem_procs,omitempty"`
+
+	// Swap usage (macOS vm.swapusage, Linux /proc/meminfo).
+	SwapTotalKB uint64 `json:"swap_total_kb,omitempty"`
+	SwapUsedKB  uint64 `json:"swap_used_kb,omitempty"`
+	SwapTotal   string `json:"swap_total,omitempty"`
+	SwapUsed    string `json:"swap_used,omitempty"`
+	SwapOK      bool   `json:"swap_ok,omitempty"`
+
+	// --- Slow tier extras ---
+	// Boot time as unix seconds; uptime = now - BootTimeSec (live, no drift).
+	BootTimeSec  int64  `json:"boot_time_sec,omitempty"`
+	BatteryPct   int    `json:"battery_pct,omitempty"`
+	BatteryState string `json:"battery_state,omitempty"` // charging|discharging|charged|ac
+	BatteryOK    bool   `json:"battery_ok,omitempty"`
+
+	// --- Footprint tier extras ---
+	// Per-pane metadata for display joins (cmd/path/window name).
+	PaneMeta    map[string]PaneMeta `json:"pane_meta,omitempty"`
+	WindowNames map[string]string   `json:"window_names,omitempty"`
+
+	// Per-pane aggregated %CPU of each pane's process subtree (macOS only).
+	PaneCPU map[string]float64 `json:"pane_cpu,omitempty"`
+	// Pane memory baseline captured ~5min ago by the daemon; used to flag
+	// panes whose footprint grew sharply.
+	PaneMemBaselineKB map[string]uint64 `json:"pane_mem_baseline_kb,omitempty"`
+
+	// Physical memory decomposition (fast tier): Activity-Monitor-style
+	// "Memory Used" — macOS: anon-purgeable+wired+compressed (vm_stat);
+	// Linux: MemTotal-MemAvailable. Wired/App break down macOS usage.
+	PhysMemUsedKB  uint64 `json:"phys_mem_used_kb,omitempty"`
+	PhysMemTotalKB uint64 `json:"phys_mem_total_kb,omitempty"`
+	PhysMemOK      bool   `json:"phys_mem_ok,omitempty"`
+	PhysWiredKB    uint64 `json:"phys_wired_kb,omitempty"`
+	PhysAppKB      uint64 `json:"phys_app_kb,omitempty"`
+
+	// CPU breakdown (fast tier, iostat us/sy/id columns; macOS only).
+	CPUUsr     float64 `json:"cpu_usr,omitempty"`
+	CPUSys     float64 `json:"cpu_sys,omitempty"`
+	CPUIdle    float64 `json:"cpu_idle,omitempty"`
+	CPUSplitOK bool    `json:"cpu_split_ok,omitempty"`
+
+	// Disk I/O throughput (fast tier, iostat tps/MB/s; macOS only).
+	DiskTps  float64 `json:"disk_tps,omitempty"`
+	DiskMBs  float64 `json:"disk_mbs,omitempty"`
+	DiskIOOK bool    `json:"disk_io_ok,omitempty"`
+
+	// Paging rates (/s), derived by the daemon from cumulative vm_stat
+	// Pageins/Pageouts (Linux: pgpgin/pgpgout) between fast samples.
+	PageInRate  float64 `json:"page_in_rate,omitempty"`
+	PageOutRate float64 `json:"page_out_rate,omitempty"`
+	PageIOOK    bool    `json:"page_io_ok,omitempty"`
+
+	// Network throughput (KB/s), derived by the daemon from cumulative
+	// counter deltas between fast samples.
+	NetRxKBs float64 `json:"net_rx_kbs,omitempty"`
+	NetTxKBs float64 `json:"net_tx_kbs,omitempty"`
+	NetOK    bool    `json:"net_ok,omitempty"`
+}
+
+// ProcStat is a single process entry for top-N listings.
+type ProcStat struct {
+	PID   int     `json:"pid"`
+	Name  string  `json:"name"`
+	CPU   float64 `json:"cpu,omitempty"`
+	MemKB uint64  `json:"mem_kb,omitempty"`
+	Mem   string  `json:"mem,omitempty"`
+}
+
+// PaneMeta describes a tmux pane's display context captured alongside
+// the memory footprint sample.
+type PaneMeta struct {
+	Session     string `json:"session"`
+	WindowIndex string `json:"window_index"`
+	WindowName  string `json:"window_name"`
+	Cmd         string `json:"cmd"`
+	Path        string `json:"path"`
 }
 
 // tmuxPane is a single pane entry from tmux list-panes.
@@ -103,6 +189,9 @@ type tmuxPane struct {
 	WindowID    string
 	PaneID      string
 	PanePID     int
+	Cmd         string
+	Path        string
+	WindowName  string
 }
 
 // MemoryKind identifies what MemoryKB represents on the current platform.
@@ -126,6 +215,7 @@ type procInfo struct {
 	PPID       int
 	MemoryKB   uint64     // per-process memory in KB
 	MemoryKind MemoryKind // semantic of MemoryKB (platform-dependent)
+	CPU        float64    // %CPU (0 where not sampled, e.g. Linux ps path)
 }
 
 // paneMemoryResult holds the aggregated memory maps (in KB).
@@ -136,26 +226,57 @@ type paneMemoryResult struct {
 	SessionMem map[string]uint64
 	TotalMem   uint64
 	Kind       MemoryKind // what the aggregated values represent
+	// PaneMeta/WindowNames carry display context for the same panes,
+	// keyed by pane_id and "session:window_index" respectively.
+	PaneMeta    map[string]PaneMeta
+	WindowNames map[string]string
+	// PaneCPU is the aggregated %CPU of each pane's process subtree
+	// (macOS only; empty on Linux where top -stats cpu is unavailable).
+	PaneCPU map[string]float64
 }
 
 // FastResult holds the sampled metrics for the fast tier.
 type FastResult struct {
-	CPU           float64
-	CPUOK         bool
-	Pressure      int
-	PressureOK    bool
-	ProcCount     int
-	ProcCountOK   bool
-	ThreadCount   int
-	ThreadCountOK bool
-	LoadAvg1m     float64
-	LoadAvgOK     bool
-	ThermalLevel  int
-	ThermalOK     bool
-	RealFreeKB    uint64
-	RealFreeOK    bool
-	CompressorKB  uint64
-	CompressorOK  bool
+	CPU            float64
+	CPUOK          bool
+	Pressure       int
+	PressureOK     bool
+	ProcCount      int
+	ProcCountOK    bool
+	ThreadCount    int
+	ThreadCountOK  bool
+	LoadAvg1m      float64
+	LoadAvg5m      float64
+	LoadAvg15m     float64
+	LoadAvgOK      bool
+	ThermalLevel   int
+	ThermalOK      bool
+	RealFreeKB     uint64
+	RealFreeOK     bool
+	CompressorKB   uint64
+	CompressorOK   bool
+	TopCPU         []ProcStat
+	TopMem         []ProcStat
+	SwapTotalKB    uint64
+	SwapUsedKB     uint64
+	SwapOK         bool
+	PhysMemUsedKB  uint64
+	PhysMemTotalKB uint64
+	PhysMemOK      bool
+	PhysWiredKB    uint64
+	PhysAppKB      uint64
+	CPUUsr         float64
+	CPUSys         float64
+	CPUIdle        float64
+	DiskTps        float64
+	DiskMBs        float64
+	DiskIOOK       bool
+	PageIns        uint64
+	PageOuts       uint64
+	PageIOOK       bool
+	NetRxBytes     uint64
+	NetTxBytes     uint64
+	NetOK          bool
 }
 
 var cpuUsagePattern = regexp.MustCompile(`CPU usage:\s*([0-9.]+)% user,\s*([0-9.]+)% sys,`)
@@ -175,6 +296,11 @@ func runCommand(name string, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...)
+	// Ensure a UTF-8 locale so tools like ps emit real UTF-8 instead of
+	// M-x caret escapes when the daemon runs under a bare launchd env.
+	if os.Getenv("LC_ALL") == "" && os.Getenv("LANG") == "" {
+		cmd.Env = append(os.Environ(), "LC_ALL=en_US.UTF-8")
+	}
 	return cmd.Output()
 }
 
@@ -228,50 +354,98 @@ func parseMacOSCPUUsageTotal(output string) (float64, bool) {
 // We locate the "us" column in the column-header line, then parse the
 // last data line at the same index (us) and index+1 (sy).
 func parseMacOSIOStatCPU(output string) (float64, bool) {
-	cpu, ok, _, _ := parseMacOSIOStat(output)
-	return cpu, ok
+	s := parseMacOSIOStat(output)
+	return s.cpuTotal, s.cpuOK
 }
 
-// parseMacOSIOStat parses iostat -c 2 -w 1 output and returns CPU total and 1m load average.
-func parseMacOSIOStat(output string) (cpu float64, cpuOK bool, load1m float64, loadOK bool) {
+// ioStatSample is everything one `iostat -c 2 -w 1` output carries:
+// CPU us/sy/id split+total, disk tps+MB/s, and the load averages.
+type ioStatSample struct {
+	cpuUsr, cpuSys, cpuIdle, cpuTotal float64
+	cpuOK                             bool
+	diskTps, diskMBs                  float64
+	diskIOOK                          bool
+	load1m, load5m, load15m           float64
+	loadOK                            bool
+}
+
+// parseMacOSIOStat parses iostat -c 2 -w 1 output. Columns are located in
+// the header line by name and the last (2nd sample) data line is read.
+func parseMacOSIOStat(output string) (s ioStatSample) {
 	lines := strings.Split(strings.TrimSpace(output), "\n")
 	if len(lines) < 4 {
-		return 0, false, 0, false
+		return s
 	}
-	headerFields := strings.Fields(lines[1])
-	usIdx := -1
-	loadIdx := -1
-	for i, f := range headerFields {
-		if f == "us" {
+	usIdx, syIdx, idIdx := -1, -1, -1
+	var tpsIdxs, mbsIdxs []int
+	loadIdx, load5Idx, load15Idx := -1, -1, -1
+	for i, f := range strings.Fields(lines[1]) {
+		switch f {
+		case "us":
 			usIdx = i
-		}
-		if f == "1m" {
+		case "sy":
+			syIdx = i
+		case "id":
+			idIdx = i
+		case "tps":
+			tpsIdxs = append(tpsIdxs, i)
+		case "MB/s":
+			mbsIdxs = append(mbsIdxs, i)
+		case "1m":
 			loadIdx = i
+		case "5m":
+			load5Idx = i
+		case "15m":
+			load15Idx = i
 		}
 	}
-	lastLine := strings.TrimSpace(lines[len(lines)-1])
-	fields := strings.Fields(lastLine)
-	if usIdx >= 0 && len(fields) >= usIdx+2 {
-		us, err1 := strconv.ParseFloat(fields[usIdx], 64)
-		sy, err2 := strconv.ParseFloat(fields[usIdx+1], 64)
-		if err1 == nil && err2 == nil {
-			total := us + sy
-			if total < 0 {
-				total = 0
+	fields := strings.Fields(strings.TrimSpace(lines[len(lines)-1]))
+	at := func(idx int) (float64, bool) {
+		if idx >= 0 && len(fields) > idx {
+			if v, err := strconv.ParseFloat(fields[idx], 64); err == nil {
+				return v, true
 			}
-			if total > 100 {
-				total = 100
-			}
-			cpu = total
-			cpuOK = true
+		}
+		return 0, false
+	}
+	us, okUs := at(usIdx)
+	sy, okSy := at(syIdx)
+	id, okId := at(idIdx)
+	if okUs && okSy {
+		s.cpuUsr, s.cpuSys = us, sy
+		s.cpuTotal = us + sy
+		if s.cpuTotal < 0 {
+			s.cpuTotal = 0
+		}
+		if s.cpuTotal > 100 {
+			s.cpuTotal = 100
+		}
+		s.cpuOK = true
+	}
+	if okId {
+		s.cpuIdle = id
+	}
+	// One tps/MB/s column group per disk — sum across disks.
+	for _, i := range tpsIdxs {
+		if v, ok := at(i); ok {
+			s.diskTps += v
+			s.diskIOOK = true
 		}
 	}
-	if loadIdx >= 0 && len(fields) > loadIdx {
-		l1, err := strconv.ParseFloat(fields[loadIdx], 64)
-		if err == nil {
-			load1m = l1
-			loadOK = true
+	for _, i := range mbsIdxs {
+		if v, ok := at(i); ok {
+			s.diskMBs += v
 		}
+	}
+	if v, ok := at(loadIdx); ok {
+		s.load1m = v
+		s.loadOK = true
+	}
+	if v, ok := at(load5Idx); ok {
+		s.load5m = v
+	}
+	if v, ok := at(load15Idx); ok {
+		s.load15m = v
 	}
 	return
 }
@@ -333,12 +507,14 @@ func parseMacOSThermalLevel(output string) (int, bool) {
 	return 0, false
 }
 
-func parseLinuxLoadAvg(output string) (load float64, loadOK bool, threads int, threadsOK bool) {
+func parseLinuxLoadAvg(output string) (l1, l5, l15 float64, loadOK bool, threads int, threadsOK bool) {
 	fields := strings.Fields(strings.TrimSpace(output))
-	if len(fields) > 0 {
-		l1, err := strconv.ParseFloat(fields[0], 64)
-		if err == nil {
-			load = l1
+	for i, dst := range []*float64{&l1, &l5, &l15} {
+		if len(fields) <= i {
+			break
+		}
+		if v, err := strconv.ParseFloat(fields[i], 64); err == nil {
+			*dst = v
 			loadOK = true
 		}
 	}
@@ -415,20 +591,23 @@ func parseProcCount(output string) int {
 	return count
 }
 
-// parseMacOSTopProcesses parses `top -l 1 -n 999 -o mem -stats pid,mem,ppid` output.
-// Returns process list with physical footprint (MEM column) in KB.
-// The MEM column uses suffixes: K (KB), M (MB), G (GB).
+// parseMacOSTopProcesses parses `top -l 1 -n 999 -o mem -stats pid,mem,ppid,cpu`
+// output. Returns process list with physical footprint (MEM column) in KB
+// and %CPU. The MEM column uses suffixes: K (KB), M (MB), G (GB).
 func parseMacOSTopProcesses(output string) []procInfo {
 	var procs []procInfo
 	scanner := bufio.NewScanner(strings.NewReader(output))
 	inProcessSection := false
 	for scanner.Scan() {
 		line := scanner.Text()
-		// Detect the process table header: "PID    MEM   PPID"
+		// Each "PID MEM PPID CPU" header starts a new sample frame; keep
+		// only the last one (top -l 2's second frame has real CPU%).
+		if strings.HasPrefix(strings.TrimSpace(line), "PID") && strings.Contains(line, "MEM") {
+			inProcessSection = true
+			procs = procs[:0]
+			continue
+		}
 		if !inProcessSection {
-			if strings.HasPrefix(strings.TrimSpace(line), "PID") && strings.Contains(line, "MEM") {
-				inProcessSection = true
-			}
 			continue
 		}
 		fields := strings.Fields(line)
@@ -447,11 +626,16 @@ func parseMacOSTopProcesses(output string) []procInfo {
 		if err != nil {
 			continue
 		}
+		var cpu float64
+		if len(fields) > 3 {
+			cpu, _ = strconv.ParseFloat(fields[3], 64)
+		}
 		procs = append(procs, procInfo{
 			PID:        pid,
 			PPID:       ppid,
 			MemoryKB:   footprintKB,
 			MemoryKind: MemoryKindFootprint,
+			CPU:        cpu,
 		})
 	}
 	return procs
@@ -566,29 +750,42 @@ func parseTmuxPanes(output string) []tmuxPane {
 		if err != nil {
 			continue
 		}
-		panes = append(panes, tmuxPane{
+		p := tmuxPane{
 			Session:     parts[0],
 			WindowIndex: parts[1],
 			WindowID:    parts[2],
 			PaneID:      parts[3],
 			PanePID:     pid,
-		})
+		}
+		if len(parts) > 5 {
+			p.Cmd = parts[5]
+		}
+		if len(parts) > 6 {
+			p.Path = parts[6]
+		}
+		if len(parts) > 7 {
+			p.WindowName = parts[7]
+		}
+		panes = append(panes, p)
 	}
 	return panes
 }
 
-// aggregatePaneMemory walks each pane's process tree and aggregates MemoryKB.
-// Each process is counted under exactly one pane (the one whose tree contains it).
-func aggregatePaneMemory(panes []tmuxPane, children map[int][]int, memByPid map[int]uint64) paneMemoryResult {
+// aggregatePaneMemory walks each pane's process tree and aggregates MemoryKB
+// plus %CPU. Each process is counted under exactly one pane (the one whose
+// tree contains it).
+func aggregatePaneMemory(panes []tmuxPane, children map[int][]int, memByPid map[int]uint64, cpuByPid map[int]float64) paneMemoryResult {
 	result := paneMemoryResult{
 		PaneMem:    map[string]uint64{},
 		WindowMem:  map[string]uint64{},
 		SessionMem: map[string]uint64{},
+		PaneCPU:    map[string]float64{},
 	}
 	claimed := map[int]bool{}
 	for _, pane := range panes {
-		total := sumDescendantMemoryClaimed(pane.PanePID, children, memByPid, claimed)
+		total, cpu := sumDescendantClaimed(pane.PanePID, children, memByPid, cpuByPid, claimed)
 		result.PaneMem[pane.PaneID] = total
+		result.PaneCPU[pane.PaneID] = cpu
 		wkey := pane.Session + ":" + pane.WindowIndex
 		result.WindowMem[wkey] += total
 		result.SessionMem[pane.Session] += total
@@ -597,18 +794,16 @@ func aggregatePaneMemory(panes []tmuxPane, children map[int][]int, memByPid map[
 	return result
 }
 
-// sumDescendantMemoryClaimed is like sumDescendantMemory but skips processes
-// already claimed by another pane.
-func sumDescendantMemoryClaimed(rootPID int, children map[int][]int, memByPid map[int]uint64, claimed map[int]bool) uint64 {
+// sumDescendantClaimed walks a pane's process subtree, aggregating both
+// MemoryKB and %CPU while skipping processes already claimed by another pane.
+func sumDescendantClaimed(rootPID int, children map[int][]int, memByPid map[int]uint64, cpuByPid map[int]float64, claimed map[int]bool) (mem uint64, cpu float64) {
 	if claimed[rootPID] {
-		return 0
+		return 0, 0
 	}
 	visited := map[int]bool{rootPID: true}
 	claimed[rootPID] = true
-	var total uint64
-	if mem, ok := memByPid[rootPID]; ok {
-		total += mem
-	}
+	mem += memByPid[rootPID]
+	cpu += cpuByPid[rootPID]
 	stack := []int{rootPID}
 	for len(stack) > 0 {
 		parent := stack[len(stack)-1]
@@ -619,11 +814,12 @@ func sumDescendantMemoryClaimed(rootPID int, children map[int][]int, memByPid ma
 			}
 			visited[child] = true
 			claimed[child] = true
-			total += memByPid[child]
+			mem += memByPid[child]
+			cpu += cpuByPid[child]
 			stack = append(stack, child)
 		}
 	}
-	return total
+	return mem, cpu
 }
 
 // FormatMemoryMB converts KB to a human-readable string (M or G).
@@ -658,24 +854,26 @@ func formatUsagePercent(value float64) string {
 
 // CPUBGColor returns the background color for a CPU percentage.
 func CPUBGColor(val float64) string {
-	if val >= 60 {
+	switch CPUSeverity(val) {
+	case SeverityCrit:
 		return "#CC9393"
-	}
-	if val >= 30 {
+	case SeverityWarn:
 		return "#F0DFAF"
+	default:
+		return "#7F9F7F"
 	}
-	return "#7F9F7F"
 }
 
 // MemPressureColor returns the background color for a memory pressure percentage.
 func MemPressureColor(pressure int) string {
-	if pressure >= 60 {
+	switch PressureSeverity(pressure) {
+	case SeverityCrit:
 		return "#CC9393"
-	}
-	if pressure >= 30 {
+	case SeverityWarn:
 		return "#F0DFAF"
+	default:
+		return "#7F9F7F"
 	}
-	return "#7F9F7F"
 }
 
 // FormatUsagePercent formats a CPU percentage string.
@@ -855,10 +1053,13 @@ func NewCollector(osName, tmuxBin string) *Collector {
 func (c *Collector) SampleFast() FastResult {
 	var res FastResult
 	var wg sync.WaitGroup
-	var cpuOut, pressureOut, procOut, thermalOut, loadOut []byte
-	var cpuErr, pressureErr, procErr, thermalErr, loadErr error
+	var cpuOut, pressureOut, procOut, thermalOut, loadOut, topOut, swapOut []byte
+	var cpuErr, pressureErr, procErr, thermalErr, loadErr, topErr, swapErr error
+	var phys physMemSample
+	var netRxBytes, netTxBytes uint64
+	var netOK bool
 
-	wg.Add(3)
+	wg.Add(7)
 	go func() {
 		defer wg.Done()
 		cpuOut, cpuErr = c.sampleCPUOutput()
@@ -870,6 +1071,22 @@ func (c *Collector) SampleFast() FastResult {
 	go func() {
 		defer wg.Done()
 		procOut, procErr = c.sampleProcCountOutput()
+	}()
+	go func() {
+		defer wg.Done()
+		topOut, topErr = runCommand("ps", "-Ao", "pid=,pcpu=,rss=,comm=")
+	}()
+	go func() {
+		defer wg.Done()
+		swapOut, swapErr = c.sampleSwapOutput()
+	}()
+	go func() {
+		defer wg.Done()
+		phys = c.samplePhysMem()
+	}()
+	go func() {
+		defer wg.Done()
+		netRxBytes, netTxBytes, netOK = c.sampleNetBytes()
 	}()
 
 	if c.os == "darwin" {
@@ -891,13 +1108,17 @@ func (c *Collector) SampleFast() FastResult {
 	if cpuErr == nil {
 		switch c.os {
 		case "darwin":
-			res.CPU, res.CPUOK, res.LoadAvg1m, res.LoadAvgOK = parseMacOSIOStat(string(cpuOut))
+			s := parseMacOSIOStat(string(cpuOut))
+			res.CPU, res.CPUOK = s.cpuTotal, s.cpuOK
+			res.CPUUsr, res.CPUSys, res.CPUIdle = s.cpuUsr, s.cpuSys, s.cpuIdle
+			res.DiskTps, res.DiskMBs, res.DiskIOOK = s.diskTps, s.diskMBs, s.diskIOOK
+			res.LoadAvg1m, res.LoadAvg5m, res.LoadAvg15m, res.LoadAvgOK = s.load1m, s.load5m, s.load15m, s.loadOK
 		case "linux":
 			res.CPU, res.CPUOK = c.parseLinuxCPU(string(cpuOut))
 		}
 	}
 	if !res.LoadAvgOK && loadErr == nil && c.os == "linux" {
-		res.LoadAvg1m, res.LoadAvgOK, res.ThreadCount, res.ThreadCountOK = parseLinuxLoadAvg(string(loadOut))
+		res.LoadAvg1m, res.LoadAvg5m, res.LoadAvg15m, res.LoadAvgOK, res.ThreadCount, res.ThreadCountOK = parseLinuxLoadAvg(string(loadOut))
 	}
 
 	// Parse memory pressure, real free, and compressor.
@@ -936,7 +1157,332 @@ func (c *Collector) SampleFast() FastResult {
 		res.ThermalLevel, res.ThermalOK = parseMacOSThermalLevel(string(thermalOut))
 	}
 
+	// Parse top processes (CPU/MEM) — one ps table, two rankings.
+	if topErr == nil {
+		procs := parseProcStats(string(topOut))
+		res.TopCPU = topProcs(procs, func(p ProcStat) float64 { return p.CPU }, 5)
+		res.TopMem = topProcs(procs, func(p ProcStat) float64 { return float64(p.MemKB) }, 5)
+	}
+
+	if phys.ok {
+		res.PhysMemUsedKB, res.PhysMemTotalKB, res.PhysMemOK = phys.usedKB, phys.totalKB, true
+		res.PhysWiredKB, res.PhysAppKB = phys.wiredKB, phys.appKB
+	}
+	if phys.pageOK {
+		res.PageIns, res.PageOuts, res.PageIOOK = phys.pageIns, phys.pageOuts, true
+	}
+	if netOK {
+		res.NetRxBytes, res.NetTxBytes, res.NetOK = netRxBytes, netTxBytes, true
+	}
+
+	// Parse swap.
+	if swapErr == nil {
+		res.SwapTotalKB, res.SwapUsedKB, res.SwapOK = c.parseSwap(string(swapOut))
+	}
+
 	return res
+}
+
+// sampleSwapOutput returns raw swap usage output.
+// macOS: sysctl vm.swapusage. Linux: /proc/meminfo (SwapTotal/SwapFree).
+func (c *Collector) sampleSwapOutput() ([]byte, error) {
+	switch c.os {
+	case "darwin":
+		return runCommand("sysctl", "vm.swapusage")
+	case "linux":
+		return runCommand("cat", "/proc/meminfo")
+	}
+	return nil, exec.ErrNotFound
+}
+
+func (c *Collector) parseSwap(output string) (totalKB, usedKB uint64, ok bool) {
+	switch c.os {
+	case "darwin":
+		return parseMacOSSwapusage(output)
+	case "linux":
+		return parseLinuxSwap(output)
+	}
+	return 0, 0, false
+}
+
+// parseProcStats parses `ps -Ao pid=,pcpu=,rss=,comm=` output.
+// comm may contain spaces; pid/pcpu/rss lead, rest is the command line.
+func parseProcStats(output string) []ProcStat {
+	scanner := bufio.NewScanner(strings.NewReader(output))
+	var procs []ProcStat
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 4 {
+			continue
+		}
+		pid, err1 := strconv.Atoi(fields[0])
+		pcpu, err2 := strconv.ParseFloat(fields[1], 64)
+		rss, err3 := strconv.Atoi(fields[2])
+		if err1 != nil || err2 != nil || err3 != nil || pid <= 0 {
+			continue
+		}
+		name := fields[3]
+		if base := path.Base(name); base != "" {
+			name = base
+		}
+		procs = append(procs, ProcStat{
+			PID:   pid,
+			Name:  name,
+			CPU:   pcpu,
+			MemKB: uint64(rss),
+			Mem:   FormatMemoryCompact(uint64(rss)),
+		})
+	}
+	return procs
+}
+
+// topProcs returns the n entries with the highest score.
+func topProcs(procs []ProcStat, score func(ProcStat) float64, n int) []ProcStat {
+	sorted := make([]ProcStat, len(procs))
+	copy(sorted, procs)
+	sort.Slice(sorted, func(i, j int) bool {
+		a, b := score(sorted[i]), score(sorted[j])
+		if a != b {
+			return a > b
+		}
+		return sorted[i].PID < sorted[j].PID
+	})
+	if len(sorted) > n {
+		sorted = sorted[:n]
+	}
+	return sorted
+}
+
+var (
+	pagesAnonPattern     = regexp.MustCompile(`Anonymous pages:\s*(\d+)`)
+	pagesPurgeablePat    = regexp.MustCompile(`Pages purgeable:\s*(\d+)`)
+	pagesWiredPattern    = regexp.MustCompile(`Pages wired down:\s*(\d+)`)
+	pagesOccupiedPattern = regexp.MustCompile(`Pages occupied by compressor:\s*(\d+)`)
+	memTotalPattern      = regexp.MustCompile(`(?m)^MemTotal:\s*(\d+)`)
+	memAvailPattern      = regexp.MustCompile(`(?m)^MemAvailable:\s*(\d+)`)
+)
+
+// physMemSample is one vm_stat reading: Activity-Monitor-style "Memory
+// Used" plus the wired/app split and cumulative paging counters.
+type physMemSample struct {
+	usedKB, totalKB, wiredKB, appKB uint64
+	ok                              bool
+	pageIns, pageOuts               uint64
+	pageOK                          bool
+}
+
+var pageInsPattern = regexp.MustCompile(`Pageins:\s*(\d+)`)
+var pageOutsPattern = regexp.MustCompile(`Pageouts:\s*(\d+)`)
+var pgpginPattern = regexp.MustCompile(`pgpgin\s+(\d+)`)
+var pgpgoutPattern = regexp.MustCompile(`pgpgout\s+(\d+)`)
+
+// samplePhysMem collects Activity-Monitor-style "Memory Used" plus the
+// wired/app breakdown and paging counters.
+// macOS: (anonymous - purgeable + wired + compressor-occupied) * page size.
+// Linux: MemTotal - MemAvailable; paging from /proc/vmstat.
+func (c *Collector) samplePhysMem() (s physMemSample) {
+	switch c.os {
+	case "darwin":
+		out, err := runCommand("vm_stat")
+		if err != nil {
+			return s
+		}
+		s.usedKB, s.wiredKB, s.appKB = parseMacOSPhysMemUsed(string(out))
+		s.pageIns, s.pageOuts = parseMacOSPageCounters(string(out))
+		s.pageOK = s.pageIns > 0 || s.pageOuts > 0
+		if tout, err := runCommand("sysctl", "-n", "hw.memsize"); err == nil {
+			if b, err := strconv.ParseUint(strings.TrimSpace(string(tout)), 10, 64); err == nil {
+				s.totalKB = b / 1024
+			}
+		}
+		s.ok = s.usedKB > 0
+		return s
+	case "linux":
+		data, err := os.ReadFile("/proc/meminfo")
+		if err == nil {
+			s.usedKB, s.totalKB, s.ok = parseLinuxPhysMem(string(data))
+		}
+		if vdata, err := os.ReadFile("/proc/vmstat"); err == nil {
+			s.pageIns, s.pageOuts = parseLinuxPageCounters(string(vdata))
+			s.pageOK = s.pageIns > 0 || s.pageOuts > 0
+		}
+		return s
+	}
+	return s
+}
+
+func parseMacOSPageCounters(output string) (ins, outs uint64) {
+	if m := pageInsPattern.FindStringSubmatch(output); len(m) == 2 {
+		ins, _ = strconv.ParseUint(m[1], 10, 64)
+	}
+	if m := pageOutsPattern.FindStringSubmatch(output); len(m) == 2 {
+		outs, _ = strconv.ParseUint(m[1], 10, 64)
+	}
+	return
+}
+
+func parseLinuxPageCounters(output string) (ins, outs uint64) {
+	if m := pgpginPattern.FindStringSubmatch(output); len(m) == 2 {
+		ins, _ = strconv.ParseUint(m[1], 10, 64)
+	}
+	if m := pgpgoutPattern.FindStringSubmatch(output); len(m) == 2 {
+		outs, _ = strconv.ParseUint(m[1], 10, 64)
+	}
+	return
+}
+
+func parseMacOSPhysMemUsed(output string) (usedKB, wiredKB, appKB uint64) {
+	pageSize := uint64(16384)
+	if m := pageSizePattern.FindStringSubmatch(output); len(m) == 2 {
+		if ps, err := strconv.ParseUint(m[1], 10, 64); err == nil && ps > 0 {
+			pageSize = ps
+		}
+	}
+	pages := func(re *regexp.Regexp) uint64 {
+		m := re.FindStringSubmatch(output)
+		if len(m) != 2 {
+			return 0
+		}
+		v, _ := strconv.ParseUint(m[1], 10, 64)
+		return v
+	}
+	anon := pages(pagesAnonPattern)
+	purgeable := pages(pagesPurgeablePat)
+	if purgeable > anon {
+		purgeable = anon
+	}
+	app := anon - purgeable
+	wired := pages(pagesWiredPattern)
+	used := app + wired + pages(pagesOccupiedPattern)
+	return used * pageSize / 1024, wired * pageSize / 1024, app * pageSize / 1024
+}
+
+func parseLinuxPhysMem(output string) (usedKB, totalKB uint64, ok bool) {
+	tm := memTotalPattern.FindStringSubmatch(output)
+	am := memAvailPattern.FindStringSubmatch(output)
+	if len(tm) != 2 || len(am) != 2 {
+		return 0, 0, false
+	}
+	t, e1 := strconv.ParseUint(tm[1], 10, 64)
+	a, e2 := strconv.ParseUint(am[1], 10, 64)
+	if e1 != nil || e2 != nil || a > t {
+		return 0, 0, false
+	}
+	return t - a, t, true
+}
+
+// sampleNetBytes returns cumulative RX/TX byte counters across non-loopback
+// interfaces; the daemon diffs successive samples into KB/s rates.
+func (c *Collector) sampleNetBytes() (rxBytes, txBytes uint64, ok bool) {
+	switch c.os {
+	case "darwin":
+		out, err := runCommand("netstat", "-ibn")
+		if err != nil {
+			return 0, 0, false
+		}
+		return parseNetstatIB(string(out))
+	case "linux":
+		data, err := os.ReadFile("/proc/net/dev")
+		if err != nil {
+			return 0, 0, false
+		}
+		return parseLinuxNetDev(string(data))
+	}
+	return 0, 0, false
+}
+
+// parseNetstatIB sums Ibytes/Obytes over the first (<Link#>) row of each
+// interface in `netstat -ibn`, skipping loopback and downed (*) interfaces.
+func parseNetstatIB(output string) (rxBytes, txBytes uint64, ok bool) {
+	seen := make(map[string]bool)
+	for _, line := range strings.Split(output, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 10 || f[0] == "Name" || strings.HasSuffix(f[0], "*") || seen[f[0]] {
+			continue
+		}
+		seen[f[0]] = true
+		if f[0] == "lo0" {
+			continue
+		}
+		rx, e1 := strconv.ParseUint(f[6], 10, 64)
+		tx, e2 := strconv.ParseUint(f[9], 10, 64)
+		if e1 == nil && e2 == nil {
+			rxBytes += rx
+			txBytes += tx
+			ok = true
+		}
+	}
+	return
+}
+
+// parseLinuxNetDev sums RX/TX bytes over non-lo lines of /proc/net/dev.
+func parseLinuxNetDev(output string) (rxBytes, txBytes uint64, ok bool) {
+	for _, line := range strings.Split(output, "\n") {
+		i := strings.IndexByte(line, ':')
+		if i < 0 {
+			continue
+		}
+		if name := strings.TrimSpace(line[:i]); name == "" || name == "lo" {
+			continue
+		}
+		f := strings.Fields(line[i+1:])
+		if len(f) < 9 {
+			continue
+		}
+		rx, e1 := strconv.ParseUint(f[0], 10, 64)
+		tx, e2 := strconv.ParseUint(f[8], 10, 64)
+		if e1 == nil && e2 == nil {
+			rxBytes += rx
+			txBytes += tx
+			ok = true
+		}
+	}
+	return
+}
+
+var swapLinePattern = regexp.MustCompile(`(total|used)\s*=\s*([0-9.]+)\s*([MG])`)
+
+// parseMacOSSwapusage parses `sysctl vm.swapusage`:
+// "total = 2048.00M  used = 512.00M  free = 1536.00M  (encrypted)"
+func parseMacOSSwapusage(output string) (totalKB, usedKB uint64, ok bool) {
+	for _, m := range swapLinePattern.FindAllStringSubmatch(output, -1) {
+		v, err := strconv.ParseFloat(m[2], 64)
+		if err != nil {
+			continue
+		}
+		kb := uint64(v * 1024)
+		if m[3] == "G" {
+			kb = uint64(v * 1024 * 1024)
+		}
+		switch m[1] {
+		case "total":
+			totalKB = kb
+		case "used":
+			usedKB = kb
+		}
+	}
+	return totalKB, usedKB, totalKB > 0
+}
+
+var swapTotalPattern = regexp.MustCompile(`(?m)^SwapTotal:\s*(\d+)`)
+var swapFreePattern = regexp.MustCompile(`(?m)^SwapFree:\s*(\d+)`)
+
+func parseLinuxSwap(output string) (totalKB, usedKB uint64, ok bool) {
+	m := swapTotalPattern.FindStringSubmatch(output)
+	if len(m) != 2 {
+		return 0, 0, false
+	}
+	t, err := strconv.ParseUint(m[1], 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	totalKB = t
+	if f := swapFreePattern.FindStringSubmatch(output); len(f) == 2 {
+		if fv, err := strconv.ParseUint(f[1], 10, 64); err == nil && fv <= t {
+			usedKB = t - fv
+		}
+	}
+	return totalKB, usedKB, true
 }
 
 func (c *Collector) sampleThermalOutput() ([]byte, error) {
@@ -1016,7 +1562,7 @@ func (c *Collector) parseLinuxCPU(output string) (float64, bool) {
 // what the memory values represent (footprint on macOS, RSS on Linux).
 func (c *Collector) SampleFootprint() (paneMemoryResult, bool) {
 	panesOut, err := runCommand(c.tmuxBin, "list-panes", "-a", "-F",
-		"#{session_name}|#{window_index}|#{window_id}|#{pane_id}|#{pane_pid}")
+		"#{session_name}|#{window_index}|#{window_id}|#{pane_id}|#{pane_pid}|#{pane_current_command}|#{pane_current_path}|#{window_name}")
 	if err != nil {
 		return paneMemoryResult{}, false
 	}
@@ -1029,7 +1575,9 @@ func (c *Collector) SampleFootprint() (paneMemoryResult, bool) {
 	var kind MemoryKind
 	switch c.os {
 	case "darwin":
-		topOut, err := runCommand("top", "-l", "1", "-n", "999", "-o", "mem", "-stats", "pid,mem,ppid")
+		// -l 2: the first top frame reports %CPU 0.0; the second frame has
+		// the interval CPU%. The parser keeps the last table.
+		topOut, err := runCommand("top", "-l", "2", "-n", "999", "-o", "mem", "-stats", "pid,mem,ppid,cpu")
 		if err != nil {
 			return paneMemoryResult{}, false
 		}
@@ -1051,11 +1599,28 @@ func (c *Collector) SampleFootprint() (paneMemoryResult, bool) {
 
 	children := buildChildrenMap(procs)
 	memByPid := make(map[int]uint64, len(procs))
+	cpuByPid := make(map[int]float64, len(procs))
 	for _, p := range procs {
 		memByPid[p.PID] = p.MemoryKB
+		cpuByPid[p.PID] = p.CPU
 	}
-	result := aggregatePaneMemory(panes, children, memByPid)
+	result := aggregatePaneMemory(panes, children, memByPid, cpuByPid)
 	result.Kind = kind
+	result.PaneMeta = make(map[string]PaneMeta, len(panes))
+	result.WindowNames = make(map[string]string, len(panes))
+	for _, p := range panes {
+		result.PaneMeta[p.PaneID] = PaneMeta{
+			Session:     p.Session,
+			WindowIndex: p.WindowIndex,
+			WindowName:  p.WindowName,
+			Cmd:         p.Cmd,
+			Path:        p.Path,
+		}
+		wkey := p.Session + ":" + p.WindowIndex
+		if p.WindowName != "" {
+			result.WindowNames[wkey] = p.WindowName
+		}
+	}
 	return result, true
 }
 
@@ -1114,4 +1679,71 @@ func (c *Collector) SampleDisk() (used, total, available uint64, ok bool) {
 	}
 	used = computeDiskUsed(c.os, sample)
 	return used, sample.TotalKB, sample.AvailableKB, true
+}
+
+// SystemInfo holds slow-tier host facts: boot time and battery state.
+type SystemInfo struct {
+	BootTimeSec  int64
+	BatteryPct   int
+	BatteryState string // discharging|charging|charged|ac|""
+	BatteryOK    bool
+}
+
+var bootTimePattern = regexp.MustCompile(`sec\s*=\s*(\d+)`)
+var battPctPattern = regexp.MustCompile(`(\d+)%`)
+var battStatePattern = regexp.MustCompile(`(discharging|charging|charged|finishing charge|not charging)`)
+
+// SampleSystemInfo collects boot time and battery state (slow tier).
+// Each sub-sample degrades independently.
+func (c *Collector) SampleSystemInfo() SystemInfo {
+	var info SystemInfo
+
+	switch c.os {
+	case "darwin":
+		if out, err := runCommand("sysctl", "kern.boottime"); err == nil {
+			if m := bootTimePattern.FindStringSubmatch(string(out)); len(m) == 2 {
+				info.BootTimeSec, _ = strconv.ParseInt(m[1], 10, 64)
+			}
+		}
+	case "linux":
+		if out, err := runCommand("cat", "/proc/uptime"); err == nil {
+			fields := strings.Fields(strings.TrimSpace(string(out)))
+			if len(fields) > 0 {
+				if up, err := strconv.ParseFloat(fields[0], 64); err == nil && up > 0 {
+					info.BootTimeSec = time.Now().Unix() - int64(up)
+				}
+			}
+		}
+	}
+
+	switch c.os {
+	case "darwin":
+		if out, err := runCommand("pmset", "-g", "batt"); err == nil {
+			s := string(out)
+			if m := battPctPattern.FindStringSubmatch(s); len(m) == 2 {
+				info.BatteryPct, _ = strconv.Atoi(m[1])
+				info.BatteryOK = true
+			}
+			if m := battStatePattern.FindStringSubmatch(s); len(m) == 2 {
+				info.BatteryState = m[1]
+			}
+			if strings.Contains(s, "AC Power") && info.BatteryState == "" {
+				info.BatteryState = "ac"
+			}
+		}
+	case "linux":
+		if matches, _ := filepath.Glob("/sys/class/power_supply/BAT*/capacity"); len(matches) > 0 {
+			if data, err := os.ReadFile(matches[0]); err == nil {
+				if pct, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil {
+					info.BatteryPct = pct
+					info.BatteryOK = true
+				}
+			}
+			if data, err := os.ReadFile(strings.TrimSuffix(matches[0], "capacity") + "status"); err == nil {
+				info.BatteryState = strings.ToLower(strings.TrimSpace(string(data)))
+			}
+		}
+	}
+
+	return info
 }

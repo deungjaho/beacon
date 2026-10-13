@@ -143,6 +143,12 @@ func main() {
 		os.Exit(cmdDaemon(args))
 	case "agents":
 		os.Exit(cmdAgents(args))
+	case "register":
+		os.Exit(cmdRegister(args))
+	case "unregister":
+		os.Exit(cmdUnregister(args))
+	case "resources":
+		os.Exit(cmdResources(args))
 	case "doctor":
 		os.Exit(cmdDoctor(args))
 	case "-h", "--help", "help":
@@ -242,6 +248,9 @@ func cmdReport(args []string) int {
 	// Best-effort cleanup.
 	livePanes := listLivePanes()
 	store.Cleanup(now, state.CompletedTTLSeconds, livePanes)
+	if reg, err := state.NewRegistryStore(defaultStateDir()); err == nil {
+		reg.MarkStaleForDeadPanes(livePanes)
+	}
 	syncBells(store)
 	return 0
 }
@@ -325,6 +334,8 @@ func cmdStatusTmux(args []string) int {
 			rargs.Compact = false
 		case "--compact", "-c":
 			rargs.Compact = true
+		case "--with-tmux-mem", "-m":
+			rargs.WithTmuxMem = true
 		default:
 			posArgs = append(posArgs, a)
 		}
@@ -364,6 +375,21 @@ func cmdStatusTmux(args []string) int {
 		fmt.Print(output)
 	}
 	return 0
+}
+
+// termCols returns the terminal column count, or 0 when not a TTY.
+func termCols() int {
+	cmd := exec.Command("stty", "size")
+	cmd.Stdin = os.Stdin
+	out, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	var rows, cols int
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(out)), "%d %d", &rows, &cols); err != nil {
+		return 0
+	}
+	return cols
 }
 
 func isTerminal(f *os.File) bool {
@@ -422,6 +448,7 @@ func cmdDashboard(args []string) int {
 			State:         st,
 			DaemonRunning: daemonRunning,
 			Hostname:      host,
+			Width:         termCols(),
 		}
 	}
 
@@ -877,7 +904,145 @@ func cmdCleanup(args []string) int {
 	}
 	livePanes := listLivePanes()
 	store.Cleanup(nowSeconds(), state.CompletedTTLSeconds, livePanes)
+	if reg, err := state.NewRegistryStore(defaultStateDir()); err == nil {
+		reg.MarkStaleForDeadPanes(livePanes)
+	}
 	syncBells(store)
+	return 0
+}
+
+// cmdRegister records a pane-owned resource reported by an external
+// producer: beacon register <type> <id> [--pane %N] [--data JSON] [--producer name]
+func cmdRegister(args []string) int {
+	var positional []string
+	pane, dataJSON, producer := "", "", ""
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--pane":
+			if i+1 < len(args) {
+				i++
+				pane = args[i]
+			}
+		case "--data":
+			if i+1 < len(args) {
+				i++
+				dataJSON = args[i]
+			}
+		case "--producer":
+			if i+1 < len(args) {
+				i++
+				producer = args[i]
+			}
+		default:
+			positional = append(positional, args[i])
+		}
+	}
+	if len(positional) < 2 {
+		fmt.Fprintln(os.Stderr, "beacon: register requires <type> <id>")
+		return 2
+	}
+	if pane == "" {
+		pane = os.Getenv("TMUX_PANE")
+	}
+	var meta map[string]any
+	if dataJSON != "" {
+		if err := json.Unmarshal([]byte(dataJSON), &meta); err != nil {
+			fmt.Fprintf(os.Stderr, "beacon: register: invalid --data JSON: %v\n", err)
+			return 2
+		}
+	}
+	reg, err := state.NewRegistryStore(defaultStateDir())
+	if err != nil {
+		return 0 // non-fatal for producers
+	}
+	rec := state.ResourceRecord{
+		Type:      positional[0],
+		ID:        positional[1],
+		OwnerPane: pane,
+		Producer:  producer,
+		Metadata:  meta,
+	}
+	if err := reg.Upsert(rec); err != nil {
+		fmt.Fprintln(os.Stderr, "beacon: register:", err)
+		return 1
+	}
+	return 0
+}
+
+func cmdUnregister(args []string) int {
+	var positional []string
+	for _, a := range args {
+		if a != "--quiet" && a != "-q" {
+			positional = append(positional, a)
+		}
+	}
+	if len(positional) < 2 {
+		fmt.Fprintln(os.Stderr, "beacon: unregister requires <type> <id>")
+		return 2
+	}
+	reg, err := state.NewRegistryStore(defaultStateDir())
+	if err != nil {
+		return 0
+	}
+	if err := reg.Remove(positional[0], positional[1]); err != nil {
+		return 1
+	}
+	return 0
+}
+
+// cmdResources lists pane-owned resources:
+// beacon resources [--type tab] [--pane %5] [--stale] [--json]
+func cmdResources(args []string) int {
+	typ, pane := "", ""
+	asJSON, staleOnly := false, false
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--type":
+			if i+1 < len(args) {
+				i++
+				typ = args[i]
+			}
+		case "--pane":
+			if i+1 < len(args) {
+				i++
+				pane = args[i]
+			}
+		case "--stale":
+			staleOnly = true
+		case "--json":
+			asJSON = true
+		}
+	}
+	reg, err := state.NewRegistryStore(defaultStateDir())
+	if err != nil {
+		return 1
+	}
+	recs := reg.List(typ, pane, staleOnly)
+	if asJSON {
+		out, _ := json.Marshal(recs)
+		fmt.Println(string(out))
+		return 0
+	}
+	if len(recs) == 0 {
+		fmt.Println("no resources")
+		return 0
+	}
+	now := nowSeconds()
+	for _, r := range recs {
+		age := now - r.CreatedAt
+		label := ""
+		if t, ok := r.Metadata["title"].(string); ok && t != "" {
+			label = t
+		} else if u, ok := r.Metadata["url"].(string); ok {
+			label = u
+		}
+		staleMark := ""
+		if r.Stale {
+			staleMark = " [stale]"
+		}
+		fmt.Printf("%-10s %-42s pane=%-4s by=%-10s age=%-4ds %s%s\n",
+			r.Type, r.ID, r.OwnerPane, r.Producer, age, label, staleMark)
+	}
 	return 0
 }
 

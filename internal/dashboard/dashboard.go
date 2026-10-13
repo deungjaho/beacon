@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,6 +31,7 @@ type Data struct {
 	State         *state.State
 	DaemonRunning bool
 	Hostname      string
+	Width         int // terminal columns; 0 → default 84
 }
 
 // Render formats a full-screen system dashboard.
@@ -55,7 +58,7 @@ func Render(d Data) string {
 		}
 	}
 
-	sb.WriteString(fmt.Sprintf("%s%sBeacon System Monitor%s  %s•%s  %s (%s/%s)  %s•%s  Daemon: %s  %s(%s)%s\n",
+	sb.WriteString(fmt.Sprintf("  %s%sBeacon System Monitor%s  %s•%s  %s (%s/%s)  %s•%s  Daemon: %s  %s(%s)%s\n",
 		colorBold, colorCyan, colorReset,
 		colorDim, colorReset,
 		host, runtime.GOOS, runtime.GOARCH,
@@ -63,122 +66,384 @@ func Render(d Data) string {
 		daemonStatus,
 		colorDim, snapTime, colorReset,
 	))
-	sb.WriteString(colorDim + strings.Repeat("─", 78) + colorReset + "\n")
+	sb.WriteString("  " + colorDim + strings.Repeat("─", d.sepWidth()) + colorReset + "\n")
 
-	// CPU & System
-	sb.WriteString(fmt.Sprintf("%s%s[CPU & 系统状态]%s\n", colorBold, colorBlue, colorReset))
+	// [系统状态] — label line (name + bar) then a value line: the main value
+	// leads at the left margin, attributes follow in fixed 18-wide cells.
+	childRow := func(cells ...string) {
+		if len(cells) == 0 {
+			return
+		}
+		sb.WriteString("    ")
+		for i, c := range cells {
+			if i < len(cells)-1 {
+				sb.WriteString(padRight(c, 18))
+			} else {
+				sb.WriteString(c)
+			}
+		}
+		sb.WriteString("\n")
+	}
+	sb.WriteString(fmt.Sprintf("  %s%s[系统状态]%s\n", colorBold, colorBlue, colorReset))
 
-	cpuBar := renderBar(d.Metrics.CPUPercent, 100.0, 18, cpuColor(d.Metrics.CPUPercent))
+	cpuBar := renderBar(d.Metrics.CPUPercent, 100.0, 16, sevColor(collector.CPUSeverity(d.Metrics.CPUPercent)))
 	cpuStr := "n/a"
 	if d.Metrics.CPUOK {
 		cpuStr = fmt.Sprintf("%.1f%%", d.Metrics.CPUPercent)
 	}
-	sb.WriteString(fmt.Sprintf("  CPU 使用率:       %s  %s\n", cpuBar, cpuStr))
-
-	thermalStr := "n/a"
+	sb.WriteString(fmt.Sprintf("    %sCPU%s    %s%s\n", colorBold, colorReset, cpuBar, staleMark(d.Metrics.CPUStale)))
+	cpuCells := []string{cpuStr}
 	if d.Metrics.ThermalOK {
-		thermalStr = formatThermal(d.Metrics.ThermalLevel)
+		cpuCells = append(cpuCells, "温控  "+formatThermal(d.Metrics.ThermalLevel))
 	}
-	sb.WriteString(fmt.Sprintf("  温控降频等级:     %s\n", thermalStr))
-
-	loadStr := "n/a"
 	if d.Metrics.LoadAvgOK {
-		loadStr = fmt.Sprintf("%s%.2f (1m)%s", loadColor(d.Metrics.LoadAvg1m), d.Metrics.LoadAvg1m, colorReset)
-	}
-	sb.WriteString(fmt.Sprintf("  系统平均负载:     %s\n", loadStr))
-
-	procStr := "n/a"
-	if d.Metrics.ProcCountOK && d.Metrics.ThreadCountOK && d.Metrics.ThreadCount > 0 {
-		procStr = fmt.Sprintf("%d procs / %d threads", d.Metrics.ProcCount, d.Metrics.ThreadCount)
-	} else if d.Metrics.ThreadCountOK && d.Metrics.ThreadCount > 0 {
-		procStr = fmt.Sprintf("%d threads", d.Metrics.ThreadCount)
-	} else if d.Metrics.ProcCountOK {
-		procStr = fmt.Sprintf("%d procs", d.Metrics.ProcCount)
-	}
-	sb.WriteString(fmt.Sprintf("  系统进程/线程:   %s\n", procStr))
-	sb.WriteString("\n")
-
-	// Memory Subsystem
-	sb.WriteString(fmt.Sprintf("%s%s[内存与压缩器]%s\n", colorBold, colorMagenta, colorReset))
-
-	memPressureStr := "n/a"
-	memBar := renderBar(float64(d.Metrics.MemPressure), 100.0, 18, pressureColor(d.Metrics.MemPressure))
-	if d.Metrics.MemPressureOK {
-		memPressureStr = fmt.Sprintf("%d%% %s", d.Metrics.MemPressure, formatPressureLabel(d.Metrics.MemPressure))
-	}
-	sb.WriteString(fmt.Sprintf("  内存压力:         %s  %s\n", memBar, memPressureStr))
-
-	freeMemStr := "n/a"
-	if d.Metrics.RealFreeMemOK && d.Metrics.RealFreeMem != "" {
-		freeMemStr = fmt.Sprintf("%s%s%s", freeMemColor(d.Metrics.RealFreeMemKB), d.Metrics.RealFreeMem, colorReset)
-	}
-	sb.WriteString(fmt.Sprintf("  真实闲置物理内存: %s\n", freeMemStr))
-
-	compStr := "n/a"
-	if d.Metrics.CompressorMemOK && d.Metrics.CompressorMem != "" {
-		compStr = fmt.Sprintf("%s%s%s", compColor(d.Metrics.CompressorMemKB), d.Metrics.CompressorMem, colorReset)
-		if d.Metrics.CompressorMemKB >= 3*1024*1024 {
-			compStr += fmt.Sprintf(" %s(内存换页压缩活跃)%s", colorYellow, colorReset)
+		loadStr := fmt.Sprintf("%s%.2f%s", sevColor(collector.LoadSeverity(d.Metrics.LoadAvg1m)), d.Metrics.LoadAvg1m, colorReset)
+		if d.Metrics.LoadAvg5m > 0 || d.Metrics.LoadAvg15m > 0 {
+			loadStr += fmt.Sprintf("/%.2f/%.2f", d.Metrics.LoadAvg5m, d.Metrics.LoadAvg15m)
 		}
+		cpuCells = append(cpuCells, "负载  "+loadStr)
 	}
-	sb.WriteString(fmt.Sprintf("  内存压缩器占用:   %s\n", compStr))
+	childRow(cpuCells...)
+	if d.Metrics.CPUSplitOK {
+		childRow(
+			fmt.Sprintf("用户  %.0f%%", d.Metrics.CPUUsr),
+			fmt.Sprintf("系统  %.0f%%", d.Metrics.CPUSys),
+			fmt.Sprintf("空闲  %.0f%%", d.Metrics.CPUIdle),
+		)
+	}
 
-	tmuxMemStr := "n/a"
-	if d.Metrics.TotalMem != "" {
-		tmuxMemStr = fmt.Sprintf("%s%s%s", colorCyan, d.Metrics.TotalMem, colorReset)
+	// 内存: main value = physical used/total; pressure/free/compressor/swap
+	// follow as attribute cells (pressure skipped when it is the fallback).
+	physShown := d.Metrics.PhysMemOK && d.Metrics.PhysMemTotalKB > 0
+	memMain := "n/a"
+	memPct := float64(d.Metrics.MemPressure)
+	if physShown {
+		memMain = fmt.Sprintf("%s/%s",
+			collector.FormatMemoryCompact(d.Metrics.PhysMemUsedKB),
+			collector.FormatMemoryCompact(d.Metrics.PhysMemTotalKB))
+		memPct = float64(d.Metrics.PhysMemUsedKB) / float64(d.Metrics.PhysMemTotalKB) * 100.0
+	} else if d.Metrics.MemPressureOK {
+		memMain = sevColor(collector.PressureSeverity(d.Metrics.MemPressure)) +
+			fmt.Sprintf("%d%%", d.Metrics.MemPressure) + colorReset
 	}
-	sb.WriteString(fmt.Sprintf("  Tmux 整体占用:    %s\n", tmuxMemStr))
 	sb.WriteString("\n")
+	memBar := renderBar(memPct, 100.0, 16, sevColor(collector.PressureSeverity(d.Metrics.MemPressure)))
+	sb.WriteString(fmt.Sprintf("    %s内存%s   %s\n", colorBold, colorReset, memBar))
+	memCells := []string{memMain}
+	if physShown && d.Metrics.MemPressureOK {
+		memCells = append(memCells, "压力  "+sevColor(collector.PressureSeverity(d.Metrics.MemPressure))+
+			fmt.Sprintf("%d%%", d.Metrics.MemPressure)+colorReset)
+	}
+	if d.Metrics.RealFreeMemOK && d.Metrics.RealFreeMem != "" {
+		memCells = append(memCells, "空闲  "+sevColor(collector.RealFreeSeverity(d.Metrics.RealFreeMemKB))+d.Metrics.RealFreeMem+colorReset)
+	}
+	if d.Metrics.CompressorMemOK && d.Metrics.CompressorMem != "" {
+		memCells = append(memCells, "压缩  "+sevColor(collector.CompressorSeverity(d.Metrics.CompressorMemKB))+d.Metrics.CompressorMem+colorReset)
+	}
+	if d.Metrics.SwapOK {
+		memCells = append(memCells, "swap  "+sevColor(collector.SwapSeverity(d.Metrics.SwapUsedKB, d.Metrics.SwapTotalKB))+fmt.Sprintf("%s/%s", d.Metrics.SwapUsed, d.Metrics.SwapTotal)+colorReset)
+	}
+	childRow(memCells...)
+	// Second value line: app/wired breakdown and paging rates.
+	var memCells2 []string
+	if d.Metrics.PhysAppKB > 0 {
+		memCells2 = append(memCells2, "应用  "+collector.FormatMemoryCompact(d.Metrics.PhysAppKB))
+	}
+	if d.Metrics.PhysWiredKB > 0 {
+		memCells2 = append(memCells2, "wired  "+collector.FormatMemoryCompact(d.Metrics.PhysWiredKB))
+	}
+	if d.Metrics.PageIOOK {
+		memCells2 = append(memCells2,
+			fmt.Sprintf("换入  %.0f/s", d.Metrics.PageInRate),
+			fmt.Sprintf("换出  %.0f/s", d.Metrics.PageOutRate))
+	}
+	childRow(memCells2...)
 
-	// Disk Storage
-	sb.WriteString(fmt.Sprintf("%s%s[根存储空间 (/)]%s\n", colorBold, colorYellow, colorReset))
-	diskStr := "n/a"
+	sb.WriteString("\n")
 	if d.Metrics.DiskOK && d.Metrics.DiskTotalKB > 0 {
 		pct := float64(d.Metrics.DiskUsedKB) / float64(d.Metrics.DiskTotalKB) * 100.0
-		diskBar := renderBar(pct, 100.0, 18, diskColor(d.Metrics.DiskAvailableKB))
-		diskStr = fmt.Sprintf("%s  %s / %s (%.1f%%)", diskBar, d.Metrics.DiskUsed, d.Metrics.DiskTotal, pct)
+		sb.WriteString(fmt.Sprintf("    %s磁盘%s   %s%s\n", colorBold, colorReset,
+			renderBar(pct, 100.0, 16, sevColor(collector.DiskSeverity(d.Metrics.DiskAvailableKB))),
+			staleMark(d.Metrics.DiskStale)))
+		diskCells := []string{fmt.Sprintf("%s/%s", d.Metrics.DiskUsed, d.Metrics.DiskTotal)}
+		if d.Metrics.DiskAvailableKB > 0 {
+			diskCells = append(diskCells, "可用  "+sevColor(collector.DiskSeverity(d.Metrics.DiskAvailableKB))+collector.FormatMemoryMB(d.Metrics.DiskAvailableKB)+colorReset)
+		}
+		if d.Metrics.DiskIOOK {
+			diskCells = append(diskCells, fmt.Sprintf("IO    %.0ftps · %.1fM/s", d.Metrics.DiskTps, d.Metrics.DiskMBs))
+		}
+		childRow(diskCells...)
+	} else {
+		sb.WriteString(fmt.Sprintf("    %s磁盘%s   n/a%s\n", colorBold, colorReset, staleMark(d.Metrics.DiskStale)))
 	}
-	sb.WriteString(fmt.Sprintf("  磁盘使用:         %s\n", diskStr))
+
+	sb.WriteString("\n")
+	var procCells []string
+	if d.Metrics.ProcCountOK {
+		procCells = append(procCells, fmt.Sprintf("%d", d.Metrics.ProcCount))
+	}
+	if d.Metrics.ThreadCountOK && d.Metrics.ThreadCount > 0 {
+		procCells = append(procCells, fmt.Sprintf("线程  %d", d.Metrics.ThreadCount))
+	}
+	if len(procCells) > 0 {
+		sb.WriteString("    " + colorBold + "进程" + colorReset + "\n")
+		childRow(procCells...)
+	}
+	if d.Metrics.NetOK {
+		sb.WriteString("\n    " + colorBold + "网络" + colorReset + "\n")
+		childRow("↓ "+fmtNetRate(d.Metrics.NetRxKBs), "↑ "+fmtNetRate(d.Metrics.NetTxKBs))
+	}
 	sb.WriteString("\n")
 
-	// Agents & Tmux Panes
-	sb.WriteString(fmt.Sprintf("%s%s[Agent 任务状态]%s\n", colorBold, colorCyan, colorReset))
-	if d.State != nil && len(d.State.Panes) > 0 {
-		count := 0
-		for pane, rec := range d.State.Panes {
-			if rec.Status == "" {
-				continue
+	// [Tmux 内存分布] — top panes with identity, per-session rollup
+	if len(d.Metrics.PaneMemKB) > 0 || len(d.Metrics.SessionMemKB) > 0 {
+		sb.WriteString(fmt.Sprintf("  %s%s[Tmux 内存分布]%s", colorBold, colorCyan, colorReset))
+		if d.Metrics.TotalMem != "" {
+			sb.WriteString(fmt.Sprintf("  %s总 %s%s", colorDim, d.Metrics.TotalMem, colorReset))
+		}
+		sb.WriteString(fmt.Sprintf("  %sΔ: 5min 变化%s", colorDim, colorReset))
+		sb.WriteString(staleMark(d.Metrics.FootprintStale) + "\n")
+
+		// Hierarchical: session (bold + total) → window row with all of
+		// that window's panes inline. Fixed ordering: session by name,
+		// window by index, pane by id — positions don't jump with usage.
+		type gPane struct {
+			id, cmd, mem, delta string
+			cpu                 float64
+		}
+		type gWin struct {
+			name, idx string
+			panes     []gPane
+		}
+		type gSess struct {
+			name  string
+			total uint64
+			wins  []*gWin
+		}
+		sessMap := map[string]*gSess{}
+		var sessOrder []*gSess
+		for id, kb := range d.Metrics.PaneMemKB {
+			meta := d.Metrics.PaneMeta[id]
+			sname := meta.Session
+			if sname == "" {
+				sname = "?"
 			}
-			count++
-			statusIcon := formatAgentStatus(rec.Status)
-			loc := fmt.Sprintf("[%s:%s]", rec.Session, rec.Window)
-			sb.WriteString(fmt.Sprintf("  • %-4s %-12s %s %s\n", pane, loc, statusIcon, rec.Summary))
+			wname := meta.WindowName
+			if wname == "" {
+				wname = meta.WindowIndex
+			}
+			wkey := meta.WindowIndex + "|" + wname
+			s := sessMap[sname]
+			if s == nil {
+				s = &gSess{name: sname}
+				sessMap[sname] = s
+				sessOrder = append(sessOrder, s)
+			}
+			var w *gWin
+			for _, x := range s.wins {
+				if x.idx+"|"+x.name == wkey {
+					w = x
+					break
+				}
+			}
+			if w == nil {
+				w = &gWin{name: wname, idx: meta.WindowIndex}
+				s.wins = append(s.wins, w)
+			}
+			mem := d.Metrics.PaneMem[id]
+			if mem == "" {
+				mem = collector.FormatMemoryMB(kb)
+			}
+			w.panes = append(w.panes, gPane{id: id, cmd: clip(meta.Cmd, 14), mem: mem,
+				delta: paneDelta(d.Metrics, id), cpu: d.Metrics.PaneCPU[id]})
+			s.total += kb
 		}
-		if count == 0 {
-			sb.WriteString("  " + colorDim + "无活跃 Agent 记录" + colorReset + "\n")
+		for _, s := range sessOrder {
+			if t := d.Metrics.SessionMemKB[s.name]; t > 0 {
+				s.total = t
+			}
 		}
-	} else {
-		sb.WriteString("  " + colorDim + "无活跃 Agent 记录" + colorReset + "\n")
+		sort.Slice(sessOrder, func(i, j int) bool { return sessOrder[i].name < sessOrder[j].name })
+		for _, s := range sessOrder {
+			sort.Slice(s.wins, func(i, j int) bool { return natLess(s.wins[i].idx, s.wins[j].idx) })
+			for _, w := range s.wins {
+				sort.Slice(w.panes, func(i, j int) bool { return natLess(w.panes[i].id, w.panes[j].id) })
+			}
+		}
+		for _, s := range sessOrder {
+			sb.WriteString(fmt.Sprintf("    %s%s%s  %s%s%s\n",
+				colorBold, s.name, colorReset, colorDim,
+				collector.FormatMemoryCompact(s.total), colorReset))
+			for _, w := range s.wins {
+				sb.WriteString("      " + padRight(w.name, 12))
+				for i, p := range w.panes {
+					if i > 0 && i%2 == 0 {
+						sb.WriteString("\n" + strings.Repeat(" ", 18))
+					}
+					cell := fmt.Sprintf("%s %s %.0f%% %s %s%s%s",
+						p.id, p.cmd, p.cpu, p.mem, colorDim, p.delta, colorReset)
+					if i == len(w.panes)-1 {
+						sb.WriteString(cell)
+					} else {
+						sb.WriteString(padRight(cell, 38))
+					}
+				}
+				sb.WriteString("\n")
+			}
+			sb.WriteString("\n")
+		}
 	}
 
-	if d.State != nil && d.State.LastCompleted != nil && d.State.LastCompleted.Summary != "" {
-		lc := d.State.LastCompleted
-		timeAgo := "刚刚"
-		if lc.Time > 0 {
-			diff := time.Since(time.Unix(lc.Time, 0)).Round(time.Minute)
-			if diff >= time.Minute {
-				timeAgo = fmt.Sprintf("%d分钟前", int(diff.Minutes()))
+	// Agents & Tmux Panes — opt-in via BEACON_SHOW_AGENTS=1
+	if os.Getenv("BEACON_SHOW_AGENTS") == "1" {
+		sb.WriteString(fmt.Sprintf("  %s%s[Agent 任务状态]%s\n", colorBold, colorCyan, colorReset))
+		if d.State != nil && len(d.State.Panes) > 0 {
+			count := 0
+			for pane, rec := range d.State.Panes {
+				if rec.Status == "" {
+					continue
+				}
+				count++
+				statusIcon := formatAgentStatus(rec.Status)
+				loc := fmt.Sprintf("[%s:%s]", rec.Session, rec.Window)
+				sb.WriteString(fmt.Sprintf("    • %-4s %-12s %s %s\n", pane, loc, statusIcon, rec.Summary))
 			}
+			if count == 0 {
+				sb.WriteString("    " + colorDim + "无活跃 Agent 记录" + colorReset + "\n")
+			}
+		} else {
+			sb.WriteString("    " + colorDim + "无活跃 Agent 记录" + colorReset + "\n")
 		}
-		sb.WriteString(fmt.Sprintf("  最近完成: %s [%s:%s] %s (%s)\n",
-			lc.Pane, lc.Session, lc.Window, lc.Summary, timeAgo))
+
+		if d.State != nil && d.State.LastCompleted != nil && d.State.LastCompleted.Summary != "" {
+			lc := d.State.LastCompleted
+			timeAgo := "刚刚"
+			if lc.Time > 0 {
+				diff := time.Since(time.Unix(lc.Time, 0)).Round(time.Minute)
+				if diff >= time.Minute {
+					timeAgo = fmt.Sprintf("%d分钟前", int(diff.Minutes()))
+				}
+			}
+			sb.WriteString(fmt.Sprintf("    最近完成: %s [%s:%s] %s (%s)\n",
+				lc.Pane, lc.Session, lc.Window, lc.Summary, timeAgo))
+		}
 	}
 
-	sb.WriteString(colorDim + strings.Repeat("─", 78) + colorReset + "\n")
-	sb.WriteString(fmt.Sprintf(" %s[q / Esc]%s 退出看板    %s[r]%s 手动刷新    %s(每 2 秒自动采样更新)%s\n",
+	sb.WriteString("  " + colorDim + strings.Repeat("─", d.sepWidth()) + colorReset + "\n")
+	sb.WriteString(fmt.Sprintf("  %s[q / Esc]%s 退出看板    %s[r]%s 手动刷新    %s(每 2 秒自动采样更新 · BEACON_SHOW_AGENTS=1 显示 Agent)%s\n",
 		colorBold, colorReset, colorBold, colorReset, colorDim, colorReset))
 
 	return sb.String()
+}
+
+// sepWidth picks the separator width: 2-cell margins on both sides.
+func (d Data) sepWidth() int {
+	if d.Width >= 56 && d.Width <= 210 {
+		return d.Width - 6
+	}
+	return 80
+}
+
+// staleMark renders a dim "数据过期" marker when a sampling tier is stale.
+func staleMark(stale bool) string {
+	if stale {
+		return colorDim + " (数据过期)" + colorReset
+	}
+	return ""
+}
+
+// natLess orders ids numerically when both are numeric (a leading "%" is
+// ignored, e.g. %2 < %13), otherwise lexically.
+func natLess(a, b string) bool {
+	na, ea := strconv.Atoi(strings.TrimPrefix(a, "%"))
+	nb, eb := strconv.Atoi(strings.TrimPrefix(b, "%"))
+	if ea == nil && eb == nil {
+		return na < nb
+	}
+	return a < b
+}
+
+// displayWidth approximates terminal cell width (CJK counts as 2).
+func displayWidth(s string) int {
+	w := 0
+	esc := false
+	for _, r := range s {
+		switch {
+		case esc:
+			if r == 'm' {
+				esc = false
+			}
+		case r == '\033':
+			esc = true
+		case r >= 0x2E80:
+			w += 2
+		default:
+			w++
+		}
+	}
+	return w
+}
+
+// padRight pads s with spaces up to the given display width.
+func padRight(s string, w int) string {
+	if d := w - displayWidth(s); d > 0 {
+		return s + strings.Repeat(" ", d)
+	}
+	return s
+}
+
+// clip truncates s to max display cells with a trailing ellipsis.
+func clip(s string, max int) string {
+	if displayWidth(s) <= max {
+		return s
+	}
+	out := make([]rune, 0, len(s))
+	w := 0
+	for _, r := range s {
+		rw := 1
+		if r >= 0x2E80 {
+			rw = 2
+		}
+		if w+rw > max-1 {
+			break
+		}
+		out = append(out, r)
+		w += rw
+	}
+	return string(out) + "…"
+}
+
+// paneDelta formats a pane's memory change vs the daemon's ~5min baseline.
+func paneDelta(m collector.Metrics, id string) string {
+	base, ok := m.PaneMemBaselineKB[id]
+	if !ok {
+		return "Δ—"
+	}
+	delta := int64(m.PaneMemKB[id]) - int64(base)
+	if delta < 0 {
+		return fmt.Sprintf("Δ-%s", collector.FormatMemoryMB(uint64(-delta)))
+	}
+	return fmt.Sprintf("Δ+%s", collector.FormatMemoryMB(uint64(delta)))
+}
+
+// fmtNetRate renders a KB/s rate as "123K/s" or "1.2M/s".
+func fmtNetRate(kbs float64) string {
+	if kbs >= 1024 {
+		return fmt.Sprintf("%.1fM/s", kbs/1024)
+	}
+	return fmt.Sprintf("%.0fK/s", kbs)
+}
+
+// sevColor maps the shared Severity onto the dashboard ANSI palette.
+func sevColor(s collector.Severity) string {
+	switch s {
+	case collector.SeverityCrit:
+		return colorRed
+	case collector.SeverityWarn:
+		return colorYellow
+	default:
+		return colorGreen
+	}
 }
 
 func renderBar(val, max float64, width int, color string) string {
@@ -202,93 +467,14 @@ func renderBar(val, max float64, width int, color string) string {
 	)
 }
 
-func cpuColor(pct float64) string {
-	if pct >= 80 {
-		return colorRed
-	}
-	if pct >= 50 {
-		return colorYellow
-	}
-	return colorGreen
-}
-
-func loadColor(load float64) string {
-	if load >= 15.0 {
-		return colorRed
-	}
-	if load >= 5.0 {
-		return colorYellow
-	}
-	return colorGreen
-}
-
-func pressureColor(p int) string {
-	if p >= 80 {
-		return colorRed
-	}
-	if p >= 60 {
-		return colorYellow
-	}
-	return colorGreen
-}
-
-func formatPressureLabel(p int) string {
-	if p >= 80 {
-		return fmt.Sprintf("%s(Critical / 内存危急)%s", colorRed, colorReset)
-	}
-	if p >= 60 {
-		return fmt.Sprintf("%s(Warning / 内存预警)%s", colorYellow, colorReset)
-	}
-	return fmt.Sprintf("%s(Normal / 正常)%s", colorGreen, colorReset)
-}
-
-func freeMemColor(kb uint64) string {
-	mb := kb / 1024
-	if mb < 500 {
-		return colorRed
-	}
-	if mb < 1500 {
-		return colorYellow
-	}
-	return colorGreen
-}
-
-func compColor(kb uint64) string {
-	mb := kb / 1024
-	if mb >= 4096 {
-		return colorRed
-	}
-	if mb >= 2048 {
-		return colorYellow
-	}
-	return colorGreen
-}
-
-func diskColor(availKB uint64) string {
-	// Less than 5 GiB -> Red
-	if availKB < 5*1024*1024 {
-		return colorRed
-	}
-	// Less than 20 GiB -> Yellow
-	if availKB < 20*1024*1024 {
-		return colorYellow
-	}
-	return colorGreen
-}
-
+// formatThermal renders a compact thermal tag: "L0" when nominal,
+// "L1降频" etc. colored by shared thermal severity.
 func formatThermal(level int) string {
-	switch level {
-	case 0:
-		return fmt.Sprintf("%sL0 (Nominal / 温度正常)%s", colorGreen, colorReset)
-	case 1:
-		return fmt.Sprintf("%sL1 (Fair / 轻度温控降频)%s", colorYellow, colorReset)
-	case 2:
-		return fmt.Sprintf("%sL2 (Serious / 严重温控限频)%s", colorMagenta, colorReset)
-	case 3:
-		return fmt.Sprintf("%sL3 (Critical / 极限过热保护)%s", colorRed, colorReset)
-	default:
-		return fmt.Sprintf("L%d", level)
+	label := fmt.Sprintf("L%d", level)
+	if level > 0 {
+		label += "降频"
 	}
+	return sevColor(collector.ThermalSeverity(level)) + label + colorReset
 }
 
 func formatAgentStatus(status string) string {

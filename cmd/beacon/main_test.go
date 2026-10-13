@@ -1383,7 +1383,7 @@ func TestCLIStatusTmuxCompactMode(t *testing.T) {
 	}, "status-tmux", "--compact", "200", "black", "test-session", "1", "%1", "@1")
 	assertContains(t, out, "45%", "CPU in compact mode")
 	assertContains(t, out, "40%", "pressure in compact mode")
-	assertContains(t, out, "1.5G", "free mem in compact mode")
+	assertNotContains(t, out, "1.5G", "free mem should be excluded in compact mode")
 	assertNotContains(t, out, "100M", "pane mem should be excluded in compact mode")
 }
 

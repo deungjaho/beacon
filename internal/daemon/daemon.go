@@ -45,9 +45,24 @@ type Daemon struct {
 	store     *state.Store
 	collector *collector.Collector
 
-	// mu protects current (the merged Metrics snapshot).
+	// mu protects current (the merged Metrics snapshot) and paneBaseline.
 	mu      sync.RWMutex
 	current collector.Metrics
+
+	// paneBaseline holds pane memory from ~5min ago (guarded by mu); the
+	// dashboard diffs current vs baseline to flag fast-growing panes.
+	paneBaseline   map[string]uint64
+	paneBaselineAt int64
+
+	// prevNet holds the previous cumulative net counters (guarded by mu)
+	// so mergeFast can derive KB/s rates from the delta.
+	prevNetRx, prevNetTx uint64
+	prevNetAt            int64
+
+	// prevPage holds the previous cumulative paging counters (guarded by
+	// mu) so mergeFast can derive pages/s rates from the delta.
+	prevPageIns, prevPageOuts uint64
+	prevPageAt                int64
 
 	// writeMu serializes snapshot file writes so concurrent tier
 	// completions don't collide on the temp file.
@@ -233,6 +248,8 @@ func (d *Daemon) sampleFast() {
 	}
 	if res.LoadAvgOK {
 		m.LoadAvg1m = res.LoadAvg1m
+		m.LoadAvg5m = res.LoadAvg5m
+		m.LoadAvg15m = res.LoadAvg15m
 		m.LoadAvgOK = true
 	}
 	if res.ThermalOK {
@@ -248,6 +265,53 @@ func (d *Daemon) sampleFast() {
 		m.CompressorMemKB = res.CompressorKB
 		m.CompressorMem = collector.FormatMemoryCompact(res.CompressorKB)
 		m.CompressorMemOK = true
+	}
+	if res.TopCPU != nil {
+		m.TopCPUProcs = res.TopCPU
+	}
+	if res.TopMem != nil {
+		m.TopMemProcs = res.TopMem
+	}
+	if res.SwapOK {
+		m.SwapTotalKB = res.SwapTotalKB
+		m.SwapUsedKB = res.SwapUsedKB
+		m.SwapTotal = collector.FormatMemoryMB(res.SwapTotalKB)
+		m.SwapUsed = collector.FormatMemoryMB(res.SwapUsedKB)
+		m.SwapOK = true
+	}
+	if res.PhysMemOK {
+		m.PhysMemUsedKB = res.PhysMemUsedKB
+		m.PhysMemTotalKB = res.PhysMemTotalKB
+		m.PhysMemOK = true
+		m.PhysWiredKB = res.PhysWiredKB
+		m.PhysAppKB = res.PhysAppKB
+	}
+	if res.CPUOK && (res.CPUUsr > 0 || res.CPUSys > 0 || res.CPUIdle > 0) {
+		m.CPUUsr, m.CPUSys, m.CPUIdle = res.CPUUsr, res.CPUSys, res.CPUIdle
+		m.CPUSplitOK = true
+	}
+	if res.DiskIOOK {
+		m.DiskTps, m.DiskMBs, m.DiskIOOK = res.DiskTps, res.DiskMBs, true
+	}
+	if res.PageIOOK {
+		if d.prevPageAt > 0 {
+			if dt := float64(now - d.prevPageAt); dt > 0 && res.PageIns >= d.prevPageIns && res.PageOuts >= d.prevPageOuts {
+				m.PageInRate = float64(res.PageIns-d.prevPageIns) / dt
+				m.PageOutRate = float64(res.PageOuts-d.prevPageOuts) / dt
+				m.PageIOOK = true
+			}
+		}
+		d.prevPageIns, d.prevPageOuts, d.prevPageAt = res.PageIns, res.PageOuts, now
+	}
+	if res.NetOK {
+		if d.prevNetAt > 0 {
+			if dt := float64(now - d.prevNetAt); dt > 0 && res.NetRxBytes >= d.prevNetRx && res.NetTxBytes >= d.prevNetTx {
+				m.NetRxKBs = float64(res.NetRxBytes-d.prevNetRx) / dt / 1024
+				m.NetTxKBs = float64(res.NetTxBytes-d.prevNetTx) / dt / 1024
+				m.NetOK = true
+			}
+		}
+		d.prevNetRx, d.prevNetTx, d.prevNetAt = res.NetRxBytes, res.NetTxBytes, now
 	}
 
 	// Mark footprint/slow stale if they haven't been sampled yet or are old.
@@ -297,6 +361,16 @@ func (d *Daemon) sampleFootprint() {
 			m.SessionMem[k] = collector.FormatMemoryMB(v)
 		}
 		m.TotalMem = collector.FormatMemoryMB(result.TotalMem)
+		m.PaneMeta = result.PaneMeta
+		m.WindowNames = result.WindowNames
+		m.PaneCPU = result.PaneCPU
+		// Refresh the ~5min baseline after exposing the old one, so this
+		// snapshot still diffs against the previous window.
+		m.PaneMemBaselineKB = d.paneBaseline
+		if d.paneBaseline == nil || now-d.paneBaselineAt > 300 {
+			d.paneBaseline = result.PaneMem
+			d.paneBaselineAt = now
+		}
 		m.FootprintOK = true
 		m.FootprintAt = now
 		m.FootprintStale = false
@@ -315,6 +389,7 @@ func (d *Daemon) sampleFootprint() {
 func (d *Daemon) sampleSlow() {
 	// Collect outside the lock — this is a slow external command.
 	diskUsed, diskTotal, diskAvail, diskOK := d.collector.SampleDisk()
+	sysInfo := d.collector.SampleSystemInfo()
 	now := time.Now().Unix()
 
 	d.mu.Lock()
@@ -331,6 +406,14 @@ func (d *Daemon) sampleSlow() {
 		m.DiskTotal = collector.FormatMemoryMB(diskTotal)
 	} else {
 		m.DiskStale = true
+	}
+	if sysInfo.BootTimeSec > 0 {
+		m.BootTimeSec = sysInfo.BootTimeSec
+	}
+	if sysInfo.BatteryOK {
+		m.BatteryPct = sysInfo.BatteryPct
+		m.BatteryState = sysInfo.BatteryState
+		m.BatteryOK = true
 	}
 
 	d.current = m

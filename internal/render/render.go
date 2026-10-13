@@ -31,6 +31,7 @@ type Args struct {
 	PaneID      string
 	WindowID    string
 	Compact     bool
+	WithTmuxMem bool
 }
 
 // Segment is a single Powerline segment.
@@ -77,10 +78,11 @@ func Render(args Args, m collector.Metrics) string {
 
 // buildSegments builds resource-only segments in strict order:
 // CPU, thermal, load, memory pressure, real free memory, compressor,
-// thread/process count, pane memory, window memory, session memory, total tmux memory,
+// process count, pane memory, window memory, session memory, total tmux memory,
 // root disk usage.
 // In compact mode, the 7 host health metrics (CPU, thermal, load, memory pressure,
-// real free memory, compressor, thread/process count) are rendered for status-right.
+// real free memory, compressor, process count) are rendered for status-right.
+// WithTmuxMem additionally renders pane/window/session memory in compact mode.
 // In full mode, all 12 segments are rendered.
 func buildSegments(args Args, m collector.Metrics) []Segment {
 	var segs []Segment
@@ -95,27 +97,17 @@ func buildSegments(args Args, m collector.Metrics) []Segment {
 		})
 	}
 
-	// 2. Thermal pressure level
-	if m.ThermalOK {
+	// 2. Thermal pressure level (full mode only)
+	if !args.Compact && m.ThermalOK {
 		segs = append(segs, Segment{
 			FG:   "#1d1f21",
 			BG:   thermalBGColor(m.ThermalLevel),
 			Text: fmt.Sprintf("%s L%d", iconThermal, m.ThermalLevel),
-			Bold: m.ThermalLevel > 0,
+			Bold: collector.ThermalSeverity(m.ThermalLevel) != collector.SeverityOK,
 		})
 	}
 
-	// 3. System Load average (1m)
-	if m.LoadAvgOK {
-		segs = append(segs, Segment{
-			FG:   "#1d1f21",
-			BG:   loadAvgBGColor(m.LoadAvg1m),
-			Text: fmt.Sprintf("%s %.1f", iconLoad, m.LoadAvg1m),
-			Bold: m.LoadAvg1m >= 10.0,
-		})
-	}
-
-	// 4. Memory pressure
+	// 3. Memory pressure
 	if m.MemPressureOK {
 		segs = append(segs, Segment{
 			FG:   "#1d1f21",
@@ -125,13 +117,23 @@ func buildSegments(args Args, m collector.Metrics) []Segment {
 		})
 	}
 
-	// 5. Real free physical memory
-	if m.RealFreeMemOK && m.RealFreeMem != "" {
+	// 4. System Load average (1m)
+	if m.LoadAvgOK {
+		segs = append(segs, Segment{
+			FG:   "#1d1f21",
+			BG:   loadAvgBGColor(m.LoadAvg1m),
+			Text: fmt.Sprintf("%s %.1f", iconLoad, m.LoadAvg1m),
+			Bold: collector.LoadSeverity(m.LoadAvg1m) == collector.SeverityCrit,
+		})
+	}
+
+	// 5. Real free physical memory (full mode only)
+	if !args.Compact && m.RealFreeMemOK && m.RealFreeMem != "" {
 		segs = append(segs, Segment{
 			FG:   "#1d1f21",
 			BG:   realFreeBGColor(m.RealFreeMemKB),
 			Text: fmt.Sprintf("%s %s", iconFreeMem, m.RealFreeMem),
-			Bold: m.RealFreeMemKB < 512*1024,
+			Bold: collector.RealFreeSeverity(m.RealFreeMemKB) == collector.SeverityCrit,
 		})
 	}
 
@@ -141,28 +143,28 @@ func buildSegments(args Args, m collector.Metrics) []Segment {
 			FG:   "#1d1f21",
 			BG:   compressorBGColor(m.CompressorMemKB),
 			Text: fmt.Sprintf("%s %s", iconCompressor, m.CompressorMem),
-			Bold: m.CompressorMemKB >= 4*1024*1024,
+			Bold: collector.CompressorSeverity(m.CompressorMemKB) == collector.SeverityCrit,
 		})
 	}
 
-	// 7. Thread/Process count
-	if m.ThreadCountOK && m.ThreadCount > 0 {
-		segs = append(segs, Segment{
-			FG:   "#1d1f21",
-			BG:   "#B48EAD",
-			Text: fmt.Sprintf("%s %d", iconProcCount, m.ThreadCount),
-			Bold: true,
-		})
-	} else if m.ProcCountOK {
+	// 7. Process count, full mode only (fall back to thread count)
+	if !args.Compact && m.ProcCountOK && m.ProcCount > 0 {
 		segs = append(segs, Segment{
 			FG:   "#1d1f21",
 			BG:   "#B48EAD",
 			Text: fmt.Sprintf("%s %d", iconProcCount, m.ProcCount),
 			Bold: true,
 		})
+	} else if !args.Compact && m.ThreadCountOK && m.ThreadCount > 0 {
+		segs = append(segs, Segment{
+			FG:   "#1d1f21",
+			BG:   "#B48EAD",
+			Text: fmt.Sprintf("%s %d", iconProcCount, m.ThreadCount),
+			Bold: true,
+		})
 	}
 
-	if !args.Compact {
+	if !args.Compact || args.WithTmuxMem {
 		// 8. Pane memory
 		if args.PaneID != "" {
 			if v, ok := m.PaneMem[args.PaneID]; ok && v != "" {
@@ -192,7 +194,9 @@ func buildSegments(args Args, m collector.Metrics) []Segment {
 				Text: fmt.Sprintf("%s %s", iconSessionMem, v),
 			})
 		}
+	}
 
+	if !args.Compact {
 		// 11. Total tmux memory
 		if m.TotalMem != "" {
 			segs = append(segs, Segment{
@@ -215,67 +219,63 @@ func buildSegments(args Args, m collector.Metrics) []Segment {
 	return segs
 }
 
-// diskLowWatermarkKB is the threshold below which the disk segment turns red.
-// 5 GiB = 5 * 1024 * 1024 KB.
-const diskLowWatermarkKB uint64 = 5 * 1024 * 1024
-
-// diskBGColor returns the disk segment background color.
-// Red (#CC9393) when available space is strictly below 5 GiB (including 0);
-// warm-brown (#DFAF8F) when available >= 5 GiB.
-// A failed sample is expressed by DiskOK=false (segment not rendered),
-// not by a zero available value.
-func diskBGColor(availableKB uint64) string {
-	if availableKB < diskLowWatermarkKB {
-		return "#CC9393"
-	}
-	return "#DFAF8F"
-}
-
+// Segment palettes share collector.Severity thresholds; only the hex
+// mapping differs per metric.
 func thermalBGColor(level int) string {
-	switch {
-	case level <= 0:
-		return "#7F9F7F"
-	case level == 1:
+	switch collector.ThermalSeverity(level) {
+	case collector.SeverityWarn:
 		return "#F0DFAF"
-	case level == 2:
+	case collector.SeverityCrit:
 		return "#CC9393"
 	default:
-		return "#DCA3A3"
+		return "#7F9F7F"
 	}
 }
 
 func loadAvgBGColor(load float64) string {
-	switch {
-	case load < 4.0:
-		return "#7F9F7F"
-	case load < 10.0:
+	switch collector.LoadSeverity(load) {
+	case collector.SeverityWarn:
 		return "#F0DFAF"
-	default:
+	case collector.SeverityCrit:
 		return "#CC9393"
+	default:
+		return "#7F9F7F"
 	}
 }
 
 func realFreeBGColor(freeKB uint64) string {
-	const giB = uint64(1024 * 1024)
-	switch {
-	case freeKB >= giB:
-		return "#5A8A8A"
-	case freeKB >= giB/2:
+	switch collector.RealFreeSeverity(freeKB) {
+	case collector.SeverityWarn:
 		return "#DFAF8F"
-	default:
+	case collector.SeverityCrit:
 		return "#CC9393"
+	default:
+		return "#5A8A8A"
 	}
 }
 
 func compressorBGColor(compKB uint64) string {
-	const giB = uint64(1024 * 1024)
-	switch {
-	case compKB < 2*giB:
-		return "#4A7A7A"
-	case compKB < 4*giB:
+	switch collector.CompressorSeverity(compKB) {
+	case collector.SeverityWarn:
 		return "#DFAF8F"
-	default:
+	case collector.SeverityCrit:
 		return "#CC9393"
+	default:
+		return "#4A7A7A"
+	}
+}
+
+// diskBGColor returns the disk segment background color: green-brown
+// when plenty, yellow below 20 GiB, red below 5 GiB. A failed sample is
+// expressed by DiskOK=false (segment not rendered), not by a zero value.
+func diskBGColor(availableKB uint64) string {
+	switch collector.DiskSeverity(availableKB) {
+	case collector.SeverityWarn:
+		return "#F0DFAF"
+	case collector.SeverityCrit:
+		return "#CC9393"
+	default:
+		return "#DFAF8F"
 	}
 }
 

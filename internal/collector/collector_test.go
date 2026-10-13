@@ -185,10 +185,11 @@ func TestAggregatePaneMemory(t *testing.T) {
 	}
 	children := buildChildrenMap(procs)
 	memByPid := map[int]uint64{}
+	cpuByPid := map[int]float64{100: 12.5, 200: 3.0}
 	for _, p := range procs {
 		memByPid[p.PID] = p.MemoryKB
 	}
-	result := aggregatePaneMemory(panes, children, memByPid)
+	result := aggregatePaneMemory(panes, children, memByPid, cpuByPid)
 	if result.PaneMem["%1"] != 1000 {
 		t.Fatalf("pane %%1: got %d want 1000", result.PaneMem["%1"])
 	}
@@ -200,6 +201,9 @@ func TestAggregatePaneMemory(t *testing.T) {
 	}
 	if result.TotalMem != 10000 {
 		t.Fatalf("total: got %d want 10000", result.TotalMem)
+	}
+	if result.PaneCPU["%1"] != 12.5 {
+		t.Fatalf("pane %%1 cpu: got %v want 12.5", result.PaneCPU["%1"])
 	}
 }
 
@@ -671,12 +675,24 @@ func TestParseMacOSIOStat(t *testing.T) {
    26.54  762 19.76  20 11 69  3.04 3.82 6.74
     4.00    8  0.03  15 13 72  3.04 3.82 6.74
 `
-	cpu, cpuOK, load, loadOK := parseMacOSIOStat(input)
-	if !cpuOK || cpu != 28.0 {
-		t.Fatalf("cpu: got %.1f, ok=%v, want 28.0, true", cpu, cpuOK)
+	s := parseMacOSIOStat(input)
+	if !s.cpuOK || s.cpuTotal != 28.0 {
+		t.Fatalf("cpu: got %.1f, ok=%v, want 28.0, true", s.cpuTotal, s.cpuOK)
 	}
-	if !loadOK || load != 3.04 {
-		t.Fatalf("load: got %.2f, ok=%v, want 3.04, true", load, loadOK)
+	if s.cpuUsr != 15 || s.cpuSys != 13 || s.cpuIdle != 72 {
+		t.Fatalf("cpu split: got %.0f/%.0f/%.0f, want 15/13/72", s.cpuUsr, s.cpuSys, s.cpuIdle)
+	}
+	if !s.diskIOOK || s.diskTps != 8 || s.diskMBs != 0.03 {
+		t.Fatalf("disk io: got %.0ftps %.2fM/s, ok=%v, want 8tps 0.03M/s, true", s.diskTps, s.diskMBs, s.diskIOOK)
+	}
+	if !s.loadOK || s.load1m != 3.04 {
+		t.Fatalf("load 1m: got %.2f, ok=%v, want 3.04, true", s.load1m, s.loadOK)
+	}
+	if s.load5m != 3.82 {
+		t.Fatalf("load 5m: got %.2f, want 3.82", s.load5m)
+	}
+	if s.load15m != 6.74 {
+		t.Fatalf("load 15m: got %.2f, want 6.74", s.load15m)
 	}
 }
 
