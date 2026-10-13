@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -599,6 +600,7 @@ func cmdTabs(args []string) int {
 		return 1
 	}
 	recs := reg.List("tab", "", staleOnly)
+	recs = reconcileLiveTabs(reg, recs)
 	if pick {
 		store, err := state.NewStore(defaultStateDir())
 		if err != nil {
@@ -637,6 +639,48 @@ func cmdTabs(args []string) int {
 			r.ID, r.OwnerPane, now-r.CreatedAt, label, staleMark)
 	}
 	return 0
+}
+
+// reconcileLiveTabs drops registry tab records whose CDP target is gone.
+// Best-effort: when the argus endpoint is unreachable every record is kept —
+// absence of the endpoint must not nuke the registry.
+func reconcileLiveTabs(reg *state.RegistryStore, recs []state.ResourceRecord) []state.ResourceRecord {
+	port := os.Getenv("ARGUS_CDP_PORT")
+	if port == "" {
+		port = "9224"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET",
+		fmt.Sprintf("http://127.0.0.1:%s/json/list", port), nil)
+	if err != nil {
+		return recs
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return recs
+	}
+	defer resp.Body.Close()
+	var targets []struct {
+		ID   string `json:"id"`
+		Type string `json:"type"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&targets); err != nil {
+		return recs
+	}
+	live := map[string]bool{}
+	for _, t := range targets {
+		live[t.ID] = true
+	}
+	out := recs[:0]
+	for _, r := range recs {
+		if r.Producer == "argus" && !live[r.ID] {
+			_ = reg.Remove(r.Type, r.ID)
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
 }
 
 // pickTab is the tmux-popup selector: fzf when available, else a numbered
