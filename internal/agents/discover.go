@@ -212,6 +212,39 @@ func devinResumeID(cmd string) string {
 	return ""
 }
 
+// sanitizeTitle 清理 devin 会话标题里的原始 tool-call JSON——会话首条记录是
+// 工具调用时 title 会变成 "functions.toolu_…{"command":…}" 这种串。尽量从
+// description 字段把可读描述捞回来，捞不到就给个占位。
+func sanitizeTitle(title string) string {
+	if !strings.HasPrefix(title, "functions.") && !strings.Contains(title, `"command"`) {
+		return title
+	}
+	extract := func(key string) string {
+		i := strings.Index(title, `"`+key+`"`)
+		if i < 0 {
+			return ""
+		}
+		rest := title[i+len(key)+2:]
+		j := strings.Index(rest, `"`)
+		if j < 0 {
+			return ""
+		}
+		rest = rest[j+1:]
+		k := strings.Index(rest, `"`)
+		if k < 0 {
+			return ""
+		}
+		return strings.TrimSpace(rest[:k])
+	}
+	if d := extract("description"); d != "" {
+		return d
+	}
+	if c := extract("command"); c != "" {
+		return "$ " + c
+	}
+	return "(tool call)"
+}
+
 // devinSessionInfo queries the Devin sessions.db for title and cwd.
 func devinSessionInfo(sessionID string) (title, cwd string) {
 	// Validate sessionID to prevent SQL injection via the sqlite3 CLI.
@@ -229,7 +262,7 @@ func devinSessionInfo(sessionID string) (title, cwd string) {
 	}
 	parts := strings.SplitN(strings.TrimSpace(string(out)), "|", 2)
 	if len(parts) >= 1 {
-		title = parts[0]
+		title = sanitizeTitle(parts[0])
 	}
 	if len(parts) >= 2 {
 		cwd = parts[1]
