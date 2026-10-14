@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -103,6 +105,10 @@ commands:
   unregister <type> <id>
   resources [--type t] [--pane %N] [--stale] [--json]
   tabs [--json] [--count] [--stale]   list agent browser tabs
+  worktrees [--json] [--pick]         list worktrees + pane occupancy + cleanup candidates
+  worktree close <path> [--force]     graceful teardown: unregister, remove, drop merged branch
+  wt new <name> [--from ref]          create worktree workspace + run wt.d hooks + register route
+  wt list / wt env / wt close <name> [--destroy] [--force]
   reset                   clear local Beacon state
   hook <prompt|stop|notification|permission>
   daemon [start|stop|status]  manage background sampler
@@ -156,6 +162,12 @@ func main() {
 		os.Exit(cmdResources(args))
 	case "tabs":
 		os.Exit(cmdTabs(args))
+	case "worktrees":
+		os.Exit(cmdWorktrees(args))
+	case "worktree":
+		os.Exit(cmdWorktree(args))
+	case "wt":
+		os.Exit(cmdWt(args))
 	case "doctor":
 		os.Exit(cmdDoctor(args))
 	case "-h", "--help", "help":
@@ -549,6 +561,31 @@ func cmdJump(args []string) int {
 	if len(args) >= 2 && args[0] == "--tab" {
 		return jumpToTab(store, args[1])
 	}
+	// `beacon jump --worktree <path>`: land on the worktree's owner pane,
+	// falling back to a pane currently inside it.
+	if len(args) >= 2 && args[0] == "--worktree" {
+		reg, err := state.NewRegistryStore(defaultStateDir())
+		if err != nil {
+			return 1
+		}
+		views, _ := assembleWorktrees(reg)
+		for _, v := range views {
+			if v.Path != canonPath(args[1]) {
+				continue
+			}
+			target := v.OwnerPane
+			if !paneIDPattern.MatchString(target) && len(v.Panes) > 0 {
+				target = v.Panes[0]
+			}
+			if paneIDPattern.MatchString(target) {
+				return jumpToPane(store, target)
+			}
+			fmt.Fprintf(os.Stderr, "beacon: worktree %s has no pane to jump to\n", args[1])
+			return 1
+		}
+		fmt.Fprintf(os.Stderr, "beacon: no worktree %q\n", args[1])
+		return 1
+	}
 	// If a pane ID argument is given, jump directly to that pane.
 	if len(args) > 0 {
 		pane := args[0]
@@ -639,6 +676,821 @@ func cmdTabs(args []string) int {
 			r.ID, r.OwnerPane, now-r.CreatedAt, label, staleMark)
 	}
 	return 0
+}
+
+// worktreeView is the read-time assembly of one worktree's full state:
+// git worktree list (existence/branch/lock) ∪ registry (port/slug/owner)
+// ∪ live pane occupancy. Nothing here is persisted beyond the registry row.
+type worktreeView struct {
+	Path       string   `json:"path"`
+	Repo       string   `json:"repo"`
+	Branch     string   `json:"branch"`
+	IsMain     bool     `json:"is_main"`
+	Registered bool     `json:"registered"`
+	Port       int      `json:"port,omitempty"`
+	Slug       string   `json:"slug,omitempty"`
+	OwnerPane  string   `json:"owner_pane,omitempty"`
+	Panes      []string `json:"panes,omitempty"`
+	Dirty      bool     `json:"dirty"`
+	DirtyFiles []string `json:"dirty_files,omitempty"`
+	Merged     bool     `json:"merged"`
+	Locked     bool     `json:"locked"`
+	Prunable   bool     `json:"prunable"`
+	State      string   `json:"state"` // occupied | idle | exposed
+	regID      string   // exact registry ID for removal
+	repoDir    string   // main checkout dir, for git worktree remove/branch ops
+}
+
+// cmdWorktrees lists every visible worktree: registered ones plus all
+// worktrees enumerated via `git worktree list` over the active repo set
+// (pane toplevels ∪ registered worktree repos). Unregistered ones surface
+// as "exposed" so nothing accumulates invisibly.
+// beacon worktrees [--json] [--pick]  — pick jumps to the owner pane.
+func cmdWorktrees(args []string) int {
+	asJSON, pick := false, false
+	for _, a := range args {
+		switch a {
+		case "--json":
+			asJSON = true
+		case "--pick":
+			pick = true
+		}
+	}
+	reg, err := state.NewRegistryStore(defaultStateDir())
+	if err != nil {
+		return 1
+	}
+	views, livePanes := assembleWorktrees(reg)
+	if pick {
+		store, err := state.NewStore(defaultStateDir())
+		if err != nil {
+			return 1
+		}
+		return pickWorktree(store, views)
+	}
+	if asJSON {
+		out, _ := json.Marshal(views)
+		fmt.Println(string(out))
+		return 0
+	}
+	if len(views) == 0 {
+		fmt.Println("no worktrees visible (devproxy register <path> or a pane inside a repo)")
+		return 0
+	}
+	for _, v := range views {
+		var b strings.Builder
+		fmt.Fprintf(&b, "%-48s %-8s", v.Path, v.State)
+		if v.IsMain {
+			b.WriteString(" main")
+		}
+		if v.Repo != "" {
+			fmt.Fprintf(&b, " repo=%s", v.Repo)
+		}
+		if v.Branch != "" {
+			fmt.Fprintf(&b, " branch=%s", v.Branch)
+		}
+		if v.Registered {
+			fmt.Fprintf(&b, " port=%d slug=%s", v.Port, v.Slug)
+		}
+		if v.OwnerPane != "" {
+			fmt.Fprintf(&b, " owner=%s", v.OwnerPane)
+		}
+		if len(v.Panes) > 0 {
+			fmt.Fprintf(&b, " in=%s", strings.Join(v.Panes, ","))
+		}
+		if v.Dirty {
+			fmt.Fprintf(&b, " dirty(%d)", len(v.DirtyFiles))
+		}
+		if v.Merged {
+			b.WriteString(" merged")
+		}
+		if v.Locked {
+			b.WriteString(" locked")
+		}
+		if v.Prunable {
+			b.WriteString(" prunable")
+		}
+		fmt.Println(b.String())
+	}
+	var cands []*worktreeView
+	for _, v := range views {
+		if v.IsMain || len(v.Panes) > 0 || v.Locked {
+			continue
+		}
+		if v.OwnerPane != "" && livePanes[v.OwnerPane] {
+			continue // owner pane still live — task line not over
+		}
+		cands = append(cands, v)
+	}
+	if len(cands) > 0 {
+		fmt.Println("\ncleanup candidates (beacon worktree close <path>):")
+		for _, v := range cands {
+			hint := "clean"
+			if v.Prunable {
+				hint = "prunable"
+			} else if v.Dirty {
+				hint = fmt.Sprintf("dirty (%d files)", len(v.DirtyFiles))
+			} else if v.Merged {
+				hint = "merged, clean"
+			}
+			fmt.Printf("  %s  %s\n", v.Path, hint)
+		}
+	}
+	return 0
+}
+
+// cmdWorktree: beacon worktree close <path> [--force]
+// Graceful teardown in fixed order: refuse occupied/dirty (unless --force),
+// drop devproxy route + registry record, git worktree remove, delete the
+// merged branch.
+func cmdWorktree(args []string) int {
+	force := false
+	var path string
+	rest := args
+	if len(rest) > 0 && rest[0] == "close" {
+		rest = rest[1:]
+	} else {
+		fmt.Fprintln(os.Stderr, "usage: beacon worktree close <path> [--force]")
+		return 2
+	}
+	for _, a := range rest {
+		if a == "--force" {
+			force = true
+		} else {
+			path = a
+		}
+	}
+	if path == "" {
+		fmt.Fprintln(os.Stderr, "usage: beacon worktree close <path> [--force]")
+		return 2
+	}
+	path = canonPath(path)
+	reg, err := state.NewRegistryStore(defaultStateDir())
+	if err != nil {
+		return 1
+	}
+	views, _ := assembleWorktrees(reg)
+	var v *worktreeView
+	for _, w := range views {
+		if w.Path == path {
+			v = w
+			break
+		}
+	}
+	if v == nil {
+		// Cold path: repo not in the active repo set — still a real
+		// worktree, build a minimal view from the filesystem.
+		v = inspectWorktree(path)
+	}
+	if v == nil {
+		fmt.Fprintf(os.Stderr, "beacon: no worktree at %s\n", path)
+		return 1
+	}
+	if len(v.Panes) > 0 && !force {
+		fmt.Fprintf(os.Stderr, "beacon: refused: %s occupied by panes %s (--force to override)\n",
+			path, strings.Join(v.Panes, ","))
+		return 1
+	}
+	if v.Locked && !force {
+		fmt.Fprintf(os.Stderr, "beacon: refused: %s is locked (git worktree unlock %s)\n", path, path)
+		return 1
+	}
+	if v.Dirty && !force {
+		fmt.Fprintf(os.Stderr, "beacon: refused: %s has uncommitted changes (--force to override):\n", path)
+		for _, f := range v.DirtyFiles {
+			fmt.Fprintf(os.Stderr, "  %s\n", f)
+		}
+		return 1
+	}
+	if v.repoDir != "" && !v.Prunable {
+		argv := []string{"-C", v.repoDir, "worktree", "remove"}
+		if force {
+			// 单个 -f 只覆盖已跟踪改动；未跟踪内容（node_modules 等）需要 -f -f
+			argv = append(argv, "--force", "--force")
+		}
+		argv = append(argv, v.Path)
+		if out, err := exec.Command("git", argv...).CombinedOutput(); err != nil {
+			fmt.Fprintf(os.Stderr, "beacon: git worktree remove: %s\n", strings.TrimSpace(string(out)))
+			return 1
+		}
+	}
+	// 先删 worktree 再摘路由/注册：反过来一旦 remove 失败，目录残留却已从
+	// 发现源里消失，变成谁都看不见的孤儿。路由残留会由 devproxy 陈旧回收兜住。
+	if v.Registered {
+		if dp, err := exec.LookPath("devproxy"); err == nil {
+			_ = exec.Command(dp, "unregister", v.Path).Run()
+		}
+		if v.regID != "" {
+			_ = reg.Remove("worktree", v.regID)
+		}
+	}
+	if v.Merged && v.Branch != "" && v.Branch != "(detached)" && v.repoDir != "" {
+		_ = exec.Command("git", "-C", v.repoDir, "branch", "-d", v.Branch).Run()
+	}
+	fmt.Printf("closed %s\n", path)
+	return 0
+}
+
+// assembleWorktrees merges three sources into one view per canonical path:
+// registry records, `git worktree list` over the derived repo set, and live
+// pane cwd occupancy. Returns views sorted (main → occupied → idle →
+// exposed) and the set of live pane IDs.
+func assembleWorktrees(reg *state.RegistryStore) ([]*worktreeView, map[string]bool) {
+	recs := reconcileWorktrees(reg, reg.List("worktree", "", false))
+	livePanes := map[string]bool{}
+	occ := map[string][]string{}
+	repoDirs := map[string]string{} // commonDir → main checkout dir
+	addRepo := func(dir string) {
+		if c := gitCommonDir(dir); c != "" {
+			repoDirs[c] = filepath.Dir(c)
+		}
+	}
+	for _, p := range listPanes() {
+		livePanes[p.id] = true
+		if top := gitToplevel(p.cwd); top != "" {
+			top = canonPath(top)
+			occ[top] = append(occ[top], p.id)
+			addRepo(top)
+		}
+	}
+	for _, r := range recs {
+		addRepo(r.ID)
+	}
+
+	views := map[string]*worktreeView{}
+	var order []string
+	get := func(path string) *worktreeView {
+		if v := views[path]; v != nil {
+			return v
+		}
+		v := &worktreeView{Path: path}
+		views[path] = v
+		order = append(order, path)
+		return v
+	}
+	for _, mainDir := range repoDirs {
+		out, err := gitOut(mainDir, "worktree", "list", "--porcelain")
+		if err != nil {
+			continue
+		}
+		repo := filepath.Base(mainDir)
+		def := gitDefaultBranch(mainDir)
+		for i, e := range parseWorktreeList(out) {
+			v := get(e.path)
+			v.repoDir = mainDir
+			v.Repo = repo
+			v.IsMain = i == 0 || e.bare
+			v.Locked = e.locked
+			v.Prunable = e.prunable
+			if e.detached {
+				v.Branch = "(detached)"
+			} else {
+				v.Branch = e.branch
+			}
+			if st, err := gitOut(e.path, "status", "--porcelain"); err == nil && st != "" {
+				v.Dirty = true
+				v.DirtyFiles = strings.Split(st, "\n")
+			}
+			if !v.IsMain && !e.detached && e.branch != "" && def != "" {
+				if err := gitRun(mainDir, "merge-base", "--is-ancestor", e.branch, def); err == nil {
+					v.Merged = true
+				}
+			}
+		}
+	}
+	for _, r := range recs {
+		v := get(canonPath(r.ID))
+		v.Registered = true
+		v.regID = r.ID
+		v.OwnerPane = r.OwnerPane
+		if port, ok := r.Metadata["port"].(float64); ok {
+			v.Port = int(port)
+		}
+		if slug, ok := r.Metadata["slug"].(string); ok {
+			v.Slug = slug
+		}
+		if v.Repo == "" {
+			if repo, ok := r.Metadata["repo"].(string); ok {
+				v.Repo = repo
+			}
+		}
+		if v.Branch == "" {
+			if b, ok := r.Metadata["branch"].(string); ok {
+				v.Branch = b
+			}
+		}
+	}
+	var out []*worktreeView
+	for _, p := range order {
+		v := views[p]
+		v.Panes = occ[p]
+		switch {
+		case len(v.Panes) > 0:
+			v.State = "occupied"
+		case v.Registered:
+			v.State = "idle"
+		default:
+			v.State = "exposed"
+		}
+		out = append(out, v)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		rank := func(v *worktreeView) int {
+			if v.IsMain {
+				return 0
+			}
+			switch v.State {
+			case "occupied":
+				return 1
+			case "idle":
+				return 2
+			}
+			return 3
+		}
+		ri, rj := rank(out[i]), rank(out[j])
+		if ri != rj {
+			return ri < rj
+		}
+		return out[i].Path < out[j].Path
+	})
+	return out, livePanes
+}
+
+// reconcileWorktrees drops registry worktree records whose path is gone or
+// no longer a git worktree (directory residue without a .git pointer).
+func reconcileWorktrees(reg *state.RegistryStore, recs []state.ResourceRecord) []state.ResourceRecord {
+	out := recs[:0]
+	for _, r := range recs {
+		if _, err := os.Stat(r.ID); err != nil || gitToplevel(r.ID) == "" {
+			_ = reg.Remove(r.Type, r.ID)
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+type paneInfo struct{ id, cwd string }
+
+func listPanes() []paneInfo {
+	out, err := exec.Command(tmuxBin(), "list-panes", "-a", "-F", "#{pane_id}\t#{pane_current_path}").Output()
+	if err != nil {
+		return nil
+	}
+	var panes []paneInfo
+	for _, line := range strings.Split(string(out), "\n") {
+		parts := strings.SplitN(strings.TrimSpace(line), "\t", 2)
+		if len(parts) < 2 || parts[1] == "" {
+			continue
+		}
+		panes = append(panes, paneInfo{id: parts[0], cwd: parts[1]})
+	}
+	return panes
+}
+
+func canonPath(p string) string {
+	if abs, err := filepath.Abs(p); err == nil {
+		p = abs
+	}
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		return r
+	}
+	return p
+}
+
+func gitOut(dir string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	argv := append([]string{"-C", dir}, args...)
+	out, err := exec.CommandContext(ctx, "git", argv...).Output()
+	return strings.TrimSpace(string(out)), err
+}
+
+func gitRun(dir string, args ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	argv := append([]string{"-C", dir}, args...)
+	return exec.CommandContext(ctx, "git", argv...).Run()
+}
+
+// gitRunSlow for mutating ops (worktree add/remove) that can take minutes on
+// large repos — the 1.5s probe timeout would kill them mid-write.
+func gitRunSlow(dir string, args ...string) error {
+	argv := append([]string{"-C", dir}, args...)
+	return exec.Command("git", argv...).Run()
+}
+
+func gitToplevel(dir string) string {
+	if dir == "" {
+		return ""
+	}
+	out, err := gitOut(dir, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return ""
+	}
+	return out
+}
+
+// gitCommonDir resolves the repo's shared .git dir (absolute, symlinks
+// evaluated) — the join key that maps any worktree back to its main repo.
+// --git-common-dir returns a path relative to the worktree (e.g. ".git" in
+// the main checkout), so it must be anchored at dir before canonicalizing.
+func gitCommonDir(dir string) string {
+	out, err := gitOut(dir, "rev-parse", "--git-common-dir")
+	if err != nil || out == "" {
+		return ""
+	}
+	if !filepath.IsAbs(out) {
+		out = filepath.Join(dir, out)
+	}
+	return canonPath(out)
+}
+
+// gitDefaultBranch: origin/HEAD short name, else main, else master.
+func gitDefaultBranch(mainDir string) string {
+	if out, err := gitOut(mainDir, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"); err == nil && out != "" {
+		return strings.TrimPrefix(out, "origin/")
+	}
+	for _, b := range []string{"main", "master"} {
+		if err := gitRun(mainDir, "show-ref", "--verify", "--quiet", "refs/heads/"+b); err == nil {
+			return b
+		}
+	}
+	return ""
+}
+
+// inspectWorktree builds a worktreeView for a path outside the active repo
+// set — used by `worktree close` on cold worktrees no pane/registration
+// currently tracks.
+func inspectWorktree(path string) *worktreeView {
+	if gitToplevel(path) == "" || canonPath(gitToplevel(path)) != path {
+		return nil
+	}
+	common := gitCommonDir(path)
+	if common == "" {
+		return nil
+	}
+	v := &worktreeView{Path: path, repoDir: filepath.Dir(common), Repo: filepath.Base(filepath.Dir(common))}
+	if b, err := gitOut(path, "branch", "--show-current"); err == nil && b != "" {
+		v.Branch = b
+	} else {
+		v.Branch = "(detached)"
+	}
+	if st, err := gitOut(path, "status", "--porcelain"); err == nil && st != "" {
+		v.Dirty = true
+		v.DirtyFiles = strings.Split(st, "\n")
+	}
+	if out, err := gitOut(v.repoDir, "worktree", "list", "--porcelain"); err == nil {
+		for _, e := range parseWorktreeList(out) {
+			if e.path == path {
+				v.Locked = e.locked
+				v.Prunable = e.prunable
+			}
+		}
+	}
+	if def := gitDefaultBranch(v.repoDir); def != "" && v.Branch != "(detached)" {
+		if err := gitRun(v.repoDir, "merge-base", "--is-ancestor", v.Branch, def); err == nil {
+			v.Merged = true
+		}
+	}
+	return v
+}
+
+type wtEntry struct {
+	path     string
+	branch   string
+	detached bool
+	bare     bool
+	locked   bool
+	prunable bool
+}
+
+func parseWorktreeList(out string) []wtEntry {
+	var ents []wtEntry
+	var cur *wtEntry
+	for _, line := range strings.Split(out, "\n") {
+		switch {
+		case strings.HasPrefix(line, "worktree "):
+			ents = append(ents, wtEntry{path: canonPath(strings.TrimPrefix(line, "worktree "))})
+			cur = &ents[len(ents)-1]
+		case cur == nil:
+		case strings.HasPrefix(line, "branch refs/heads/"):
+			cur.branch = strings.TrimPrefix(line, "branch refs/heads/")
+		case line == "detached":
+			cur.detached = true
+		case line == "bare":
+			cur.bare = true
+		case strings.HasPrefix(line, "locked"):
+			cur.locked = true
+		case strings.HasPrefix(line, "prunable"):
+			cur.prunable = true
+		}
+	}
+	return ents
+}
+
+// pickWorktree is the tmux-popup selector; selection jumps to the owner
+// pane, falling back to a pane currently inside the worktree.
+func pickWorktree(store *state.Store, views []*worktreeView) int {
+	if len(views) == 0 {
+		fmt.Println("no worktrees")
+		return 0
+	}
+	labels := make([]string, len(views))
+	for i, v := range views {
+		labels[i] = fmt.Sprintf("%s\t%s %s %s %s", v.Path, v.State, v.Slug, v.Branch, v.OwnerPane)
+	}
+	var picked string
+	if fzf, err := exec.LookPath("fzf"); err == nil {
+		cmd := exec.Command(fzf, "--with-nth=2..", "--header=worktrees — enter to jump to pane")
+		cmd.Stdin = strings.NewReader(strings.Join(labels, "\n") + "\n")
+		out, err := cmd.Output()
+		if err != nil {
+			return 0
+		}
+		picked = strings.Fields(string(out))[0]
+	} else {
+		for i, l := range labels {
+			fmt.Printf("%2d) %s\n", i+1, l)
+		}
+		fmt.Print("jump to # ")
+		var n int
+		if _, err := fmt.Scan(&n); err != nil || n < 1 || n > len(views) {
+			return 0
+		}
+		picked = views[n-1].Path
+	}
+	for _, v := range views {
+		if v.Path == canonPath(picked) {
+			target := v.OwnerPane
+			if !paneIDPattern.MatchString(target) && len(v.Panes) > 0 {
+				target = v.Panes[0]
+			}
+			if paneIDPattern.MatchString(target) {
+				return jumpToPane(store, target)
+			}
+			fmt.Fprintf(os.Stderr, "beacon: worktree %s has no pane to jump to\n", picked)
+			return 1
+		}
+	}
+	return 1
+}
+
+// ── wt: generic worktree workspace lifecycle ────────────────────────────
+//
+// A "workspace" = git worktree + deterministic ports + project hooks.
+// beacon knows nothing about project internals; the repo declares hooks as
+// executables under <root>/wt.d/ (or <root>/local/wt.d/):
+//
+//	ports    plain text, one service name per line → WT_PORT_<NAME>
+//	seed     runs once at `wt new` (write config, create db, install deps)
+//	start    bring the stack up (local, remote, anywhere — script's choice)
+//	stop     graceful shutdown before teardown
+//	destroy  deep cleanup on `wt close --destroy` (drop db, remote purge)
+//
+// All hooks run with cwd=worktree and env: WT_PATH WT_ROOT WT_SLUG WT_PANE
+// WT_PORT (entry port) WT_PORT_<NAME> for each ports file entry.
+// Port/slug derivation MUST match devproxy (shared fnv contract).
+
+const (
+	wtBasePort = 3000
+	wtPortSpan = 4000
+)
+
+var wtNonDNS = regexp.MustCompile(`[^a-z0-9-]+`)
+
+func wtSlug(absPath string) string {
+	slug := wtNonDNS.ReplaceAllString(strings.ToLower(filepath.Base(absPath)), "-")
+	if slug = strings.Trim(slug, "-"); slug == "" {
+		return "root"
+	}
+	return slug
+}
+
+func wtPort(absPath, name string) int {
+	key := absPath
+	if name != "" {
+		key += "\x00" + name
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key))
+	return wtBasePort + int(h.Sum32()%uint32(wtPortSpan))
+}
+
+// wtHookDir locates the project's hook dir: wt.d/ first, local/wt.d/ for
+// repos whose personal files live under local/.
+func wtHookDir(root string) string {
+	for _, d := range []string{filepath.Join(root, "wt.d"), filepath.Join(root, "local", "wt.d")} {
+		if info, err := os.Stat(d); err == nil && info.IsDir() {
+			return d
+		}
+	}
+	return ""
+}
+
+func wtPortNames(root string) []string {
+	hd := wtHookDir(root)
+	if hd == "" {
+		return nil
+	}
+	data, err := os.ReadFile(filepath.Join(hd, "ports"))
+	if err != nil {
+		return nil
+	}
+	var names []string
+	for _, line := range strings.Split(string(data), "\n") {
+		if n := strings.TrimSpace(line); n != "" && !strings.HasPrefix(n, "#") {
+			names = append(names, n)
+		}
+	}
+	return names
+}
+
+// wtMainRoot resolves the main checkout of whatever dir sits inside —
+// toplevel of a worktree is the worktree, so anchor via git-common-dir.
+func wtMainRoot(dir string) string {
+	top := gitToplevel(dir)
+	if top == "" {
+		return ""
+	}
+	if c := gitCommonDir(top); c != "" {
+		return canonPath(filepath.Dir(c))
+	}
+	return canonPath(top)
+}
+
+func wtEnv(root, path string) []string {
+	env := append(os.Environ(),
+		"WT_PATH="+path,
+		"WT_ROOT="+root,
+		"WT_SLUG="+wtSlug(path),
+		"WT_PORT="+strconv.Itoa(wtPort(path, "")),
+	)
+	for _, name := range wtPortNames(root) {
+		key := "WT_PORT_" + strings.ToUpper(strings.NewReplacer("-", "_", " ", "_").Replace(name))
+		env = append(env, key+"="+strconv.Itoa(wtPort(path, name)))
+	}
+	if p := os.Getenv("TMUX_PANE"); p != "" {
+		env = append(env, "WT_PANE="+p)
+	}
+	return env
+}
+
+func runWtHook(hookDir, name, worktree string, env []string) error {
+	hook := filepath.Join(hookDir, name)
+	info, err := os.Stat(hook)
+	if err != nil || info.IsDir() || info.Mode()&0o111 == 0 {
+		return nil // absent or non-executable = no hook
+	}
+	fmt.Fprintf(os.Stderr, "wt: hook %s\n", name)
+	cmd := exec.Command(hook)
+	cmd.Dir = worktree
+	cmd.Env = env
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func cmdWt(args []string) int {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: beacon wt <new|list|close|env>")
+		return 2
+	}
+	switch args[0] {
+	case "new":
+		return cmdWtNew(args[1:])
+	case "list":
+		return cmdWorktrees(args[1:])
+	case "env":
+		return cmdWtEnv()
+	case "close":
+		return cmdWtClose(args[1:])
+	default:
+		fmt.Fprintf(os.Stderr, "beacon: unknown wt subcommand %q\n", args[0])
+		return 2
+	}
+}
+
+func cmdWtNew(args []string) int {
+	name, from := "", "HEAD"
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--from" && i+1 < len(args) {
+			from = args[i+1]
+			i++
+		} else if name == "" {
+			name = args[i]
+		}
+	}
+	if name == "" {
+		fmt.Fprintln(os.Stderr, "usage: beacon wt new <name> [--from ref]")
+		return 2
+	}
+	cwd, _ := os.Getwd()
+	root := wtMainRoot(cwd)
+	if root == "" {
+		fmt.Fprintln(os.Stderr, "beacon: not inside a git repo")
+		return 1
+	}
+	dirName := strings.NewReplacer("/", "-", " ", "-").Replace(name)
+	path := canonPath(filepath.Join(filepath.Dir(root), filepath.Base(root)+"-"+dirName))
+	if _, err := os.Stat(path); err == nil {
+		fmt.Fprintf(os.Stderr, "beacon: %s already exists\n", path)
+		return 1
+	}
+	if err := gitRunSlow(root, "worktree", "add", path, "-b", name, from); err != nil {
+		// Branch may already exist — attach to it instead of creating.
+		if err := gitRunSlow(root, "worktree", "add", path, name); err != nil {
+			fmt.Fprintf(os.Stderr, "beacon: git worktree add failed (branch %q)\n", name)
+			return 1
+		}
+	}
+	env := wtEnv(root, path)
+	hookDir := wtHookDir(root)
+	if hookDir != "" {
+		if err := runWtHook(hookDir, "seed", path, env); err != nil {
+			fmt.Fprintf(os.Stderr, "beacon: seed hook failed — removing worktree\n")
+			_ = gitRunSlow(root, "worktree", "remove", "--force", path)
+			return 1
+		}
+		if err := runWtHook(hookDir, "start", path, env); err != nil {
+			fmt.Fprintf(os.Stderr, "beacon: start hook failed — worktree kept, stack may be partial\n")
+		}
+	}
+	if dp, err := exec.LookPath("devproxy"); err == nil {
+		_ = exec.Command(dp, "register", path).Run()
+	}
+	fmt.Printf("%s  →  http://%s.dev.localhost:7999 (entry port %d)\n",
+		path, wtSlug(path), wtPort(path, ""))
+	return 0
+}
+
+// cmdWtClose runs project stop/destroy hooks, then the standard worktree
+// teardown. Hooks run after close succeeds — they key off WT_SLUG/WT_PORT,
+// not the (now removed) directory.
+func cmdWtClose(args []string) int {
+	var extra []string
+	var target string
+	destroy := false
+	for _, a := range args {
+		switch a {
+		case "--destroy":
+			destroy = true
+		case "--force":
+			extra = append(extra, a)
+		default:
+			target = a
+		}
+	}
+	if target == "" {
+		fmt.Fprintln(os.Stderr, "usage: beacon wt close <name|path> [--destroy] [--force]")
+		return 2
+	}
+	root := wtMainRoot(mustGetwd())
+	if root == "" {
+		fmt.Fprintln(os.Stderr, "beacon: not inside a git repo")
+		return 1
+	}
+	path := canonPath(target)
+	if !filepath.IsAbs(target) {
+		path = canonPath(filepath.Join(filepath.Dir(root), filepath.Base(root)+"-"+target))
+	}
+	env := wtEnv(root, path)
+	hookDir := wtHookDir(root)
+	// stop 先于 worktree 删除：服务还引用着目录；close 失败时资源也已收干净。
+	if hookDir != "" {
+		if err := runWtHook(hookDir, "stop", filepath.Dir(path), env); err != nil {
+			fmt.Fprintf(os.Stderr, "beacon: wt stop hook failed: %v\n", err)
+		}
+	}
+	code := cmdWorktree(append([]string{"close", path}, extra...))
+	if code != 0 {
+		return code
+	}
+	if hookDir != "" && destroy {
+		if err := runWtHook(hookDir, "destroy", filepath.Dir(path), env); err != nil {
+			fmt.Fprintf(os.Stderr, "beacon: wt destroy hook failed: %v\n", err)
+		}
+	}
+	return 0
+}
+
+func cmdWtEnv() int {
+	root := wtMainRoot(mustGetwd())
+	if root == "" {
+		fmt.Fprintln(os.Stderr, "beacon: not inside a git repo")
+		return 1
+	}
+	for _, e := range wtEnv(root, canonPath(mustGetwd())) {
+		if strings.HasPrefix(e, "WT_") {
+			fmt.Println(e)
+		}
+	}
+	return 0
+}
+
+func mustGetwd() string {
+	d, _ := os.Getwd()
+	return d
 }
 
 // reconcileLiveTabs drops registry tab records whose CDP target is gone.
