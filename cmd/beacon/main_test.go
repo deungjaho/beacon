@@ -1507,3 +1507,79 @@ func TestCLIWorktreesLifecycle(t *testing.T) {
 		t.Fatalf("clean exposed worktree close failed: %d\n%s", code2, out2)
 	}
 }
+
+func (te *testEnv) runIn(dir string, args ...string) (string, int) {
+	te.t.Helper()
+	cmd := exec.Command(te.bin, args...)
+	cmd.Env = te.env()
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	code := 0
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			code = exitErr.ExitCode()
+		} else {
+			te.t.Fatalf("run beacon %v: %v", args, err)
+		}
+	}
+	return string(out), code
+}
+
+// TestCLIWtLifecycle: wt.d hook contract — seed/start run at new with WT_*
+// env; close runs stop, --destroy runs destroy after teardown.
+func TestCLIWtLifecycle(t *testing.T) {
+	te := newTestEnv(t)
+	te.run("reset")
+	repo := filepath.Join(te.tmpDir, "proj")
+	gitDo := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	os.MkdirAll(repo, 0o755)
+	gitDo(repo, "init", "-b", "main")
+	gitDo(repo, "commit", "--allow-empty", "-m", "init")
+
+	hookLog := filepath.Join(te.tmpDir, "hooks.log")
+	hd := filepath.Join(repo, "wt.d")
+	os.MkdirAll(hd, 0o755)
+	os.WriteFile(filepath.Join(hd, "ports"), []byte("vite\ngateway\n"), 0o644)
+	for _, name := range []string{"seed", "start", "stop", "destroy"} {
+		script := fmt.Sprintf("#!/bin/sh\necho \"%s $WT_SLUG $WT_PORT $WT_PORT_VITE\" >> %s\n", name, hookLog)
+		os.WriteFile(filepath.Join(hd, name), []byte(script), 0o755)
+	}
+
+	out, code := te.runIn(repo, "wt", "new", "feat-x")
+	if code != 0 {
+		t.Fatalf("wt new: %d\n%s", code, out)
+	}
+	wt := filepath.Join(te.tmpDir, "proj-feat-x")
+	if _, err := os.Stat(wt); err != nil {
+		t.Fatalf("worktree not created")
+	}
+	log, _ := os.ReadFile(hookLog)
+	lines := strings.Split(strings.TrimSpace(string(log)), "\n")
+	if len(lines) != 2 || !strings.HasPrefix(lines[0], "seed proj-feat-x ") || !strings.HasPrefix(lines[1], "start ") {
+		t.Fatalf("hooks wrong: %v", lines)
+	}
+	if !strings.Contains(lines[0], " proj-feat-x ") {
+		t.Fatalf("WT_SLUG missing: %q", lines[0])
+	}
+
+	// close: teardown then stop+destroy hooks
+	if _, code := te.runIn(repo, "wt", "close", "feat-x", "--destroy"); code != 0 {
+		t.Fatalf("wt close failed")
+	}
+	if _, err := os.Stat(wt); !os.IsNotExist(err) {
+		t.Fatalf("worktree dir still exists")
+	}
+	log, _ = os.ReadFile(hookLog)
+	lines = strings.Split(strings.TrimSpace(string(log)), "\n")
+	if len(lines) != 4 || !strings.HasPrefix(lines[2], "stop ") || !strings.HasPrefix(lines[3], "destroy ") {
+		t.Fatalf("close hooks wrong: %v", lines)
+	}
+}

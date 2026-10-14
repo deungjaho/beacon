@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"os"
@@ -106,6 +107,8 @@ commands:
   tabs [--json] [--count] [--stale]   list agent browser tabs
   worktrees [--json] [--pick]         list worktrees + pane occupancy + cleanup candidates
   worktree close <path> [--force]     graceful teardown: unregister, remove, drop merged branch
+  wt new <name> [--from ref]          create worktree workspace + run wt.d hooks + register route
+  wt list / wt env / wt close <name> [--destroy] [--force]
   reset                   clear local Beacon state
   hook <prompt|stop|notification|permission>
   daemon [start|stop|status]  manage background sampler
@@ -163,6 +166,8 @@ func main() {
 		os.Exit(cmdWorktrees(args))
 	case "worktree":
 		os.Exit(cmdWorktree(args))
+	case "wt":
+		os.Exit(cmdWt(args))
 	case "doctor":
 		os.Exit(cmdDoctor(args))
 	case "-h", "--help", "help":
@@ -1219,6 +1224,244 @@ func pickWorktree(store *state.Store, views []*worktreeView) int {
 		}
 	}
 	return 1
+}
+
+// ── wt: generic worktree workspace lifecycle ────────────────────────────
+//
+// A "workspace" = git worktree + deterministic ports + project hooks.
+// beacon knows nothing about project internals; the repo declares hooks as
+// executables under <root>/wt.d/ (or <root>/local/wt.d/):
+//
+//	ports    plain text, one service name per line → WT_PORT_<NAME>
+//	seed     runs once at `wt new` (write config, create db, install deps)
+//	start    bring the stack up (local, remote, anywhere — script's choice)
+//	stop     graceful shutdown before teardown
+//	destroy  deep cleanup on `wt close --destroy` (drop db, remote purge)
+//
+// All hooks run with cwd=worktree and env: WT_PATH WT_ROOT WT_SLUG WT_PANE
+// WT_PORT (entry port) WT_PORT_<NAME> for each ports file entry.
+// Port/slug derivation MUST match devproxy (shared fnv contract).
+
+const (
+	wtBasePort = 3000
+	wtPortSpan = 4000
+)
+
+var wtNonDNS = regexp.MustCompile(`[^a-z0-9-]+`)
+
+func wtSlug(absPath string) string {
+	slug := wtNonDNS.ReplaceAllString(strings.ToLower(filepath.Base(absPath)), "-")
+	if slug = strings.Trim(slug, "-"); slug == "" {
+		return "root"
+	}
+	return slug
+}
+
+func wtPort(absPath, name string) int {
+	key := absPath
+	if name != "" {
+		key += "\x00" + name
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key))
+	return wtBasePort + int(h.Sum32()%uint32(wtPortSpan))
+}
+
+// wtHookDir locates the project's hook dir: wt.d/ first, local/wt.d/ for
+// repos whose personal files live under local/.
+func wtHookDir(root string) string {
+	for _, d := range []string{filepath.Join(root, "wt.d"), filepath.Join(root, "local", "wt.d")} {
+		if info, err := os.Stat(d); err == nil && info.IsDir() {
+			return d
+		}
+	}
+	return ""
+}
+
+func wtPortNames(root string) []string {
+	hd := wtHookDir(root)
+	if hd == "" {
+		return nil
+	}
+	data, err := os.ReadFile(filepath.Join(hd, "ports"))
+	if err != nil {
+		return nil
+	}
+	var names []string
+	for _, line := range strings.Split(string(data), "\n") {
+		if n := strings.TrimSpace(line); n != "" && !strings.HasPrefix(n, "#") {
+			names = append(names, n)
+		}
+	}
+	return names
+}
+
+func wtEnv(root, path string) []string {
+	env := append(os.Environ(),
+		"WT_PATH="+path,
+		"WT_ROOT="+root,
+		"WT_SLUG="+wtSlug(path),
+		"WT_PORT="+strconv.Itoa(wtPort(path, "")),
+	)
+	for _, name := range wtPortNames(root) {
+		key := "WT_PORT_" + strings.ToUpper(strings.NewReplacer("-", "_", " ", "_").Replace(name))
+		env = append(env, key+"="+strconv.Itoa(wtPort(path, name)))
+	}
+	if p := os.Getenv("TMUX_PANE"); p != "" {
+		env = append(env, "WT_PANE="+p)
+	}
+	return env
+}
+
+func runWtHook(hookDir, name, worktree string, env []string) error {
+	hook := filepath.Join(hookDir, name)
+	info, err := os.Stat(hook)
+	if err != nil || info.IsDir() || info.Mode()&0o111 == 0 {
+		return nil // absent or non-executable = no hook
+	}
+	fmt.Fprintf(os.Stderr, "wt: hook %s\n", name)
+	cmd := exec.Command(hook)
+	cmd.Dir = worktree
+	cmd.Env = env
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func cmdWt(args []string) int {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: beacon wt <new|list|close|env>")
+		return 2
+	}
+	switch args[0] {
+	case "new":
+		return cmdWtNew(args[1:])
+	case "list":
+		return cmdWorktrees(args[1:])
+	case "env":
+		return cmdWtEnv()
+	case "close":
+		return cmdWtClose(args[1:])
+	default:
+		fmt.Fprintf(os.Stderr, "beacon: unknown wt subcommand %q\n", args[0])
+		return 2
+	}
+}
+
+func cmdWtNew(args []string) int {
+	name, from := "", "HEAD"
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--from" && i+1 < len(args) {
+			from = args[i+1]
+			i++
+		} else if name == "" {
+			name = args[i]
+		}
+	}
+	if name == "" {
+		fmt.Fprintln(os.Stderr, "usage: beacon wt new <name> [--from ref]")
+		return 2
+	}
+	cwd, _ := os.Getwd()
+	root := gitToplevel(cwd)
+	if root == "" {
+		fmt.Fprintln(os.Stderr, "beacon: not inside a git repo")
+		return 1
+	}
+	root = canonPath(root)
+	dirName := strings.NewReplacer("/", "-", " ", "-").Replace(name)
+	path := canonPath(filepath.Join(filepath.Dir(root), filepath.Base(root)+"-"+dirName))
+	if _, err := os.Stat(path); err == nil {
+		fmt.Fprintf(os.Stderr, "beacon: %s already exists\n", path)
+		return 1
+	}
+	if err := gitRun(root, "worktree", "add", path, "-b", name, from); err != nil {
+		fmt.Fprintf(os.Stderr, "beacon: git worktree add failed\n")
+		return 1
+	}
+	env := wtEnv(root, path)
+	hookDir := wtHookDir(root)
+	if hookDir != "" {
+		if err := runWtHook(hookDir, "seed", path, env); err != nil {
+			fmt.Fprintf(os.Stderr, "beacon: seed hook failed — removing worktree\n")
+			_ = gitRun(root, "worktree", "remove", "--force", path)
+			return 1
+		}
+		if err := runWtHook(hookDir, "start", path, env); err != nil {
+			fmt.Fprintf(os.Stderr, "beacon: start hook failed — worktree kept, stack may be partial\n")
+		}
+	}
+	if dp, err := exec.LookPath("devproxy"); err == nil {
+		_ = exec.Command(dp, "register", path).Run()
+	}
+	fmt.Printf("%s  →  http://%s.dev.localhost:7999 (entry port %d)\n",
+		path, wtSlug(path), wtPort(path, ""))
+	return 0
+}
+
+// cmdWtClose runs project stop/destroy hooks, then the standard worktree
+// teardown. Hooks run after close succeeds — they key off WT_SLUG/WT_PORT,
+// not the (now removed) directory.
+func cmdWtClose(args []string) int {
+	var extra []string
+	var target string
+	destroy := false
+	for _, a := range args {
+		switch a {
+		case "--destroy":
+			destroy = true
+		case "--force":
+			extra = append(extra, a)
+		default:
+			target = a
+		}
+	}
+	if target == "" {
+		fmt.Fprintln(os.Stderr, "usage: beacon wt close <name|path> [--destroy] [--force]")
+		return 2
+	}
+	root := gitToplevel(mustGetwd())
+	if root == "" {
+		fmt.Fprintln(os.Stderr, "beacon: not inside a git repo")
+		return 1
+	}
+	root = canonPath(root)
+	path := canonPath(target)
+	if !filepath.IsAbs(target) {
+		path = canonPath(filepath.Join(filepath.Dir(root), filepath.Base(root)+"-"+target))
+	}
+	env := wtEnv(root, path)
+	hookDir := wtHookDir(root)
+	code := cmdWorktree(append([]string{"close", path}, extra...))
+	if code != 0 {
+		return code
+	}
+	if hookDir != "" {
+		_ = runWtHook(hookDir, "stop", filepath.Dir(path), env)
+		if destroy {
+			_ = runWtHook(hookDir, "destroy", filepath.Dir(path), env)
+		}
+	}
+	return 0
+}
+
+func cmdWtEnv() int {
+	root := gitToplevel(mustGetwd())
+	if root == "" {
+		fmt.Fprintln(os.Stderr, "beacon: not inside a git repo")
+		return 1
+	}
+	for _, e := range wtEnv(canonPath(root), canonPath(mustGetwd())) {
+		if strings.HasPrefix(e, "WT_") {
+			fmt.Println(e)
+		}
+	}
+	return 0
+}
+
+func mustGetwd() string {
+	d, _ := os.Getwd()
+	return d
 }
 
 // reconcileLiveTabs drops registry tab records whose CDP target is gone.
