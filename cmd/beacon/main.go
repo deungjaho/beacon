@@ -829,7 +829,7 @@ func cmdWorktree(args []string) int {
 	if err != nil {
 		return 1
 	}
-	views, _ := assembleWorktrees(reg)
+	views, livePanes := assembleWorktrees(reg)
 	var v *worktreeView
 	for _, w := range views {
 		if w.Path == path {
@@ -846,21 +846,8 @@ func cmdWorktree(args []string) int {
 		fmt.Fprintf(os.Stderr, "beacon: no worktree at %s\n", path)
 		return 1
 	}
-	if len(v.Panes) > 0 && !force {
-		fmt.Fprintf(os.Stderr, "beacon: refused: %s occupied by panes %s (--force to override)\n",
-			path, strings.Join(v.Panes, ","))
-		return 1
-	}
-	if v.Locked && !force {
-		fmt.Fprintf(os.Stderr, "beacon: refused: %s is locked (git worktree unlock %s)\n", path, path)
-		return 1
-	}
-	if v.Dirty && !force {
-		fmt.Fprintf(os.Stderr, "beacon: refused: %s has uncommitted changes (--force to override):\n", path)
-		for _, f := range v.DirtyFiles {
-			fmt.Fprintf(os.Stderr, "  %s\n", f)
-		}
-		return 1
+	if code := wtClosePreflight(v, force, livePanes); code != 0 {
+		return code
 	}
 	if v.repoDir != "" && !v.Prunable {
 		argv := []string{"-C", v.repoDir, "worktree", "remove"}
@@ -1330,10 +1317,53 @@ func wtEnv(root, path string) []string {
 		key := "WT_PORT_" + strings.ToUpper(strings.NewReplacer("-", "_", " ", "_").Replace(name))
 		env = append(env, key+"="+strconv.Itoa(wtPort(path, name)))
 	}
-	if p := os.Getenv("TMUX_PANE"); p != "" {
+	if p := wtOwnerPane(); p != "" {
 		env = append(env, "WT_PANE="+p)
 	}
 	return env
+}
+
+// wtOwnerPane 解析调用者所在 tmux pane。交互 shell 有 TMUX_PANE；agent exec
+// 环境（devin/agy 的工具进程）不继承它，沿 ppid 链上溯到 pane shell pid 反推。
+func wtOwnerPane() string {
+	if p := os.Getenv("TMUX_PANE"); p != "" {
+		return p
+	}
+	out, err := exec.Command(tmuxBin(), "list-panes", "-a", "-F", "#{pane_id} #{pane_pid}").Output()
+	if err != nil {
+		return ""
+	}
+	paneByPID := map[int]string{}
+	for _, line := range strings.Split(string(out), "\n") {
+		f := strings.Fields(line)
+		if len(f) != 2 {
+			continue
+		}
+		if pid, err := strconv.Atoi(f[1]); err == nil {
+			paneByPID[pid] = f[0]
+		}
+	}
+	if len(paneByPID) == 0 {
+		return ""
+	}
+	ppid := map[int]int{}
+	if ps, err := exec.Command("ps", "-axo", "pid=,ppid=").Output(); err == nil {
+		for _, line := range strings.Split(string(ps), "\n") {
+			f := strings.Fields(line)
+			if len(f) != 2 {
+				continue
+			}
+			pid, _ := strconv.Atoi(f[0])
+			p, _ := strconv.Atoi(f[1])
+			ppid[pid] = p
+		}
+	}
+	for pid, ok := ppid[os.Getpid()]; ok && pid > 1; pid, ok = ppid[pid] {
+		if pane, hit := paneByPID[pid]; hit {
+			return pane
+		}
+	}
+	return ""
 }
 
 func runWtHook(hookDir, name, worktree string, env []string) error {
@@ -1394,7 +1424,20 @@ func cmdWtNew(args []string) int {
 	dirName := strings.NewReplacer("/", "-", " ", "-").Replace(name)
 	path := canonPath(filepath.Join(filepath.Dir(root), filepath.Base(root)+"-"+dirName))
 	if _, err := os.Stat(path); err == nil {
-		fmt.Fprintf(os.Stderr, "beacon: %s already exists\n", path)
+		// 区分活工作区与残渣目录：前者直接报身份，后者提示手动清
+		live := false
+		if out, err := gitOut(root, "worktree", "list", "--porcelain"); err == nil {
+			for _, e := range parseWorktreeList(out) {
+				if e.path == path {
+					live = true
+				}
+			}
+		}
+		if live {
+			fmt.Fprintf(os.Stderr, "beacon: %s already exists as a live worktree\n", path)
+		} else {
+			fmt.Fprintf(os.Stderr, "beacon: %s already exists and is not a worktree (stale dir — remove it or pick another name)\n", path)
+		}
 		return 1
 	}
 	if err := gitRunSlow(root, "worktree", "add", path, "-b", name, from); err != nil {
@@ -1404,23 +1447,86 @@ func cmdWtNew(args []string) int {
 			return 1
 		}
 	}
+	// 早注册：provisioning 要跑几分钟，期间 owner/路由记录就得在位，
+	// 否则并发 close 看不到 owner 防护和占用信息
+	wtRegisterRoute(path)
 	env := wtEnv(root, path)
 	hookDir := wtHookDir(root)
-	if hookDir != "" {
+	if hookDir == "" {
+		fmt.Fprintln(os.Stderr, "wt: no wt.d hooks found — route registered but nothing is serving on the entry port yet")
+	} else {
 		if err := runWtHook(hookDir, "seed", path, env); err != nil {
 			fmt.Fprintf(os.Stderr, "beacon: seed hook failed — removing worktree\n")
 			_ = gitRunSlow(root, "worktree", "remove", "--force", path)
+			wtUnregisterRoute(path)
 			return 1
 		}
 		if err := runWtHook(hookDir, "start", path, env); err != nil {
 			fmt.Fprintf(os.Stderr, "beacon: start hook failed — worktree kept, stack may be partial\n")
 		}
 	}
-	if dp, err := exec.LookPath("devproxy"); err == nil {
-		_ = exec.Command(dp, "register", path).Run()
+	// 并发 close 可能在 hook 跑完后把目录端掉：注册/打 URL 前先确认还活着
+	if _, err := os.Stat(path); err != nil {
+		fmt.Fprintf(os.Stderr, "beacon: %s vanished during provisioning (concurrent close?) — skipping route registration\n", path)
+		wtUnregisterRoute(path)
+		return 1
 	}
 	fmt.Printf("%s  →  http://%s.dev.localhost:7999 (entry port %d)\n",
 		path, wtSlug(path), wtPort(path, ""))
+	return 0
+}
+
+// wtRegisterRoute/wtUnregisterRoute 经 devproxy 注册路由；register 顺带把
+// owner pane 推给 beacon registry，通过 TMUX_PANE 把解析出的 pane 传下去。
+func wtRegisterRoute(path string) {
+	dp, err := exec.LookPath("devproxy")
+	if err != nil {
+		return
+	}
+	cmd := exec.Command(dp, "register", path)
+	if p := wtOwnerPane(); p != "" {
+		cmd.Env = append(os.Environ(), "TMUX_PANE="+p)
+	}
+	_ = cmd.Run()
+}
+
+func wtUnregisterRoute(path string) {
+	if dp, err := exec.LookPath("devproxy"); err == nil {
+		_ = exec.Command(dp, "unregister", path).Run()
+	}
+}
+
+// wtClosePreflight 是 wt close / worktree close 共用的拒绝检查：
+// 必须先于任何 stop 钩子运行——否则拒绝发生时服务已停、目录还在，是半拆状态。
+// 返回退出码，0 = 放行。
+func wtClosePreflight(v *worktreeView, force bool, livePanes map[string]bool) int {
+	if v == nil || force {
+		return 0
+	}
+	if len(v.Panes) > 0 {
+		fmt.Fprintf(os.Stderr, "beacon: refused: %s occupied by panes %s (--force to override)\n",
+			v.Path, strings.Join(v.Panes, ","))
+		return 1
+	}
+	if v.Locked {
+		fmt.Fprintf(os.Stderr, "beacon: refused: %s is locked (git worktree unlock %s)\n", v.Path, v.Path)
+		return 1
+	}
+	if v.Dirty {
+		fmt.Fprintf(os.Stderr, "beacon: refused: %s has uncommitted changes (--force to override):\n", v.Path)
+		for _, f := range v.DirtyFiles {
+			fmt.Fprintf(os.Stderr, "  %s\n", f)
+		}
+		return 1
+	}
+	// owner 防护：owner pane 活着且不是调用者 → 无提示拆除是事故路径
+	if v.OwnerPane != "" && livePanes[v.OwnerPane] {
+		if caller := wtOwnerPane(); caller != v.OwnerPane {
+			fmt.Fprintf(os.Stderr, "beacon: refused: %s is owned by live pane %s (you are pane %q; --force to override)\n",
+				v.Path, v.OwnerPane, caller)
+			return 1
+		}
+	}
 	return 0
 }
 
@@ -1430,12 +1536,13 @@ func cmdWtNew(args []string) int {
 func cmdWtClose(args []string) int {
 	var extra []string
 	var target string
-	destroy := false
+	destroy, force := false, false
 	for _, a := range args {
 		switch a {
 		case "--destroy":
 			destroy = true
 		case "--force":
+			force = true
 			extra = append(extra, a)
 		default:
 			target = a
@@ -1454,9 +1561,20 @@ func cmdWtClose(args []string) int {
 	if !filepath.IsAbs(target) {
 		path = canonPath(filepath.Join(filepath.Dir(root), filepath.Base(root)+"-"+target))
 	}
+	// 预检必须先于 stop 钩子：占用/锁/dirty/owner 拒绝时服务不该已停
+	if reg, err := state.NewRegistryStore(defaultStateDir()); err == nil {
+		views, livePanes := assembleWorktrees(reg)
+		for _, v := range views {
+			if v.Path == path {
+				if code := wtClosePreflight(v, force, livePanes); code != 0 {
+					return code
+				}
+				break
+			}
+		}
+	}
 	env := wtEnv(root, path)
 	hookDir := wtHookDir(root)
-	// stop 先于 worktree 删除：服务还引用着目录；close 失败时资源也已收干净。
 	if hookDir != "" {
 		if err := runWtHook(hookDir, "stop", filepath.Dir(path), env); err != nil {
 			fmt.Fprintf(os.Stderr, "beacon: wt stop hook failed: %v\n", err)
