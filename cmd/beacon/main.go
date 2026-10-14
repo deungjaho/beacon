@@ -862,23 +862,26 @@ func cmdWorktree(args []string) int {
 		}
 		return 1
 	}
+	if v.repoDir != "" && !v.Prunable {
+		argv := []string{"-C", v.repoDir, "worktree", "remove"}
+		if force {
+			// 单个 -f 只覆盖已跟踪改动；未跟踪内容（node_modules 等）需要 -f -f
+			argv = append(argv, "--force", "--force")
+		}
+		argv = append(argv, v.Path)
+		if out, err := exec.Command("git", argv...).CombinedOutput(); err != nil {
+			fmt.Fprintf(os.Stderr, "beacon: git worktree remove: %s\n", strings.TrimSpace(string(out)))
+			return 1
+		}
+	}
+	// 先删 worktree 再摘路由/注册：反过来一旦 remove 失败，目录残留却已从
+	// 发现源里消失，变成谁都看不见的孤儿。路由残留会由 devproxy 陈旧回收兜住。
 	if v.Registered {
 		if dp, err := exec.LookPath("devproxy"); err == nil {
 			_ = exec.Command(dp, "unregister", v.Path).Run()
 		}
 		if v.regID != "" {
 			_ = reg.Remove("worktree", v.regID)
-		}
-	}
-	if v.repoDir != "" && !v.Prunable {
-		argv := []string{"-C", v.repoDir, "worktree", "remove"}
-		if force {
-			argv = append(argv, "--force")
-		}
-		argv = append(argv, v.Path)
-		if out, err := exec.Command("git", argv...).CombinedOutput(); err != nil {
-			fmt.Fprintf(os.Stderr, "beacon: git worktree remove: %s\n", strings.TrimSpace(string(out)))
-			return 1
 		}
 	}
 	if v.Merged && v.Branch != "" && v.Branch != "(detached)" && v.repoDir != "" {
@@ -1068,6 +1071,13 @@ func gitRun(dir string, args ...string) error {
 	defer cancel()
 	argv := append([]string{"-C", dir}, args...)
 	return exec.CommandContext(ctx, "git", argv...).Run()
+}
+
+// gitRunSlow for mutating ops (worktree add/remove) that can take minutes on
+// large repos — the 1.5s probe timeout would kill them mid-write.
+func gitRunSlow(dir string, args ...string) error {
+	argv := append([]string{"-C", dir}, args...)
+	return exec.Command("git", argv...).Run()
 }
 
 func gitToplevel(dir string) string {
@@ -1296,6 +1306,19 @@ func wtPortNames(root string) []string {
 	return names
 }
 
+// wtMainRoot resolves the main checkout of whatever dir sits inside —
+// toplevel of a worktree is the worktree, so anchor via git-common-dir.
+func wtMainRoot(dir string) string {
+	top := gitToplevel(dir)
+	if top == "" {
+		return ""
+	}
+	if c := gitCommonDir(top); c != "" {
+		return canonPath(filepath.Dir(c))
+	}
+	return canonPath(top)
+}
+
 func wtEnv(root, path string) []string {
 	env := append(os.Environ(),
 		"WT_PATH="+path,
@@ -1363,28 +1386,30 @@ func cmdWtNew(args []string) int {
 		return 2
 	}
 	cwd, _ := os.Getwd()
-	root := gitToplevel(cwd)
+	root := wtMainRoot(cwd)
 	if root == "" {
 		fmt.Fprintln(os.Stderr, "beacon: not inside a git repo")
 		return 1
 	}
-	root = canonPath(root)
 	dirName := strings.NewReplacer("/", "-", " ", "-").Replace(name)
 	path := canonPath(filepath.Join(filepath.Dir(root), filepath.Base(root)+"-"+dirName))
 	if _, err := os.Stat(path); err == nil {
 		fmt.Fprintf(os.Stderr, "beacon: %s already exists\n", path)
 		return 1
 	}
-	if err := gitRun(root, "worktree", "add", path, "-b", name, from); err != nil {
-		fmt.Fprintf(os.Stderr, "beacon: git worktree add failed\n")
-		return 1
+	if err := gitRunSlow(root, "worktree", "add", path, "-b", name, from); err != nil {
+		// Branch may already exist — attach to it instead of creating.
+		if err := gitRunSlow(root, "worktree", "add", path, name); err != nil {
+			fmt.Fprintf(os.Stderr, "beacon: git worktree add failed (branch %q)\n", name)
+			return 1
+		}
 	}
 	env := wtEnv(root, path)
 	hookDir := wtHookDir(root)
 	if hookDir != "" {
 		if err := runWtHook(hookDir, "seed", path, env); err != nil {
 			fmt.Fprintf(os.Stderr, "beacon: seed hook failed — removing worktree\n")
-			_ = gitRun(root, "worktree", "remove", "--force", path)
+			_ = gitRunSlow(root, "worktree", "remove", "--force", path)
 			return 1
 		}
 		if err := runWtHook(hookDir, "start", path, env); err != nil {
@@ -1420,38 +1445,42 @@ func cmdWtClose(args []string) int {
 		fmt.Fprintln(os.Stderr, "usage: beacon wt close <name|path> [--destroy] [--force]")
 		return 2
 	}
-	root := gitToplevel(mustGetwd())
+	root := wtMainRoot(mustGetwd())
 	if root == "" {
 		fmt.Fprintln(os.Stderr, "beacon: not inside a git repo")
 		return 1
 	}
-	root = canonPath(root)
 	path := canonPath(target)
 	if !filepath.IsAbs(target) {
 		path = canonPath(filepath.Join(filepath.Dir(root), filepath.Base(root)+"-"+target))
 	}
 	env := wtEnv(root, path)
 	hookDir := wtHookDir(root)
+	// stop 先于 worktree 删除：服务还引用着目录；close 失败时资源也已收干净。
+	if hookDir != "" {
+		if err := runWtHook(hookDir, "stop", filepath.Dir(path), env); err != nil {
+			fmt.Fprintf(os.Stderr, "beacon: wt stop hook failed: %v\n", err)
+		}
+	}
 	code := cmdWorktree(append([]string{"close", path}, extra...))
 	if code != 0 {
 		return code
 	}
-	if hookDir != "" {
-		_ = runWtHook(hookDir, "stop", filepath.Dir(path), env)
-		if destroy {
-			_ = runWtHook(hookDir, "destroy", filepath.Dir(path), env)
+	if hookDir != "" && destroy {
+		if err := runWtHook(hookDir, "destroy", filepath.Dir(path), env); err != nil {
+			fmt.Fprintf(os.Stderr, "beacon: wt destroy hook failed: %v\n", err)
 		}
 	}
 	return 0
 }
 
 func cmdWtEnv() int {
-	root := gitToplevel(mustGetwd())
+	root := wtMainRoot(mustGetwd())
 	if root == "" {
 		fmt.Fprintln(os.Stderr, "beacon: not inside a git repo")
 		return 1
 	}
-	for _, e := range wtEnv(canonPath(root), canonPath(mustGetwd())) {
+	for _, e := range wtEnv(root, canonPath(mustGetwd())) {
 		if strings.HasPrefix(e, "WT_") {
 			fmt.Println(e)
 		}
