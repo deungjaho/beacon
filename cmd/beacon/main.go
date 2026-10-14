@@ -103,6 +103,7 @@ commands:
   unregister <type> <id>
   resources [--type t] [--pane %N] [--stale] [--json]
   tabs [--json] [--count] [--stale]   list agent browser tabs
+  worktrees [--json] [--pick]         list registered worktrees + pane occupancy
   reset                   clear local Beacon state
   hook <prompt|stop|notification|permission>
   daemon [start|stop|status]  manage background sampler
@@ -156,6 +157,8 @@ func main() {
 		os.Exit(cmdResources(args))
 	case "tabs":
 		os.Exit(cmdTabs(args))
+	case "worktrees":
+		os.Exit(cmdWorktrees(args))
 	case "doctor":
 		os.Exit(cmdDoctor(args))
 	case "-h", "--help", "help":
@@ -549,6 +552,24 @@ func cmdJump(args []string) int {
 	if len(args) >= 2 && args[0] == "--tab" {
 		return jumpToTab(store, args[1])
 	}
+	// `beacon jump --worktree <path>`: land on the worktree's owner pane.
+	if len(args) >= 2 && args[0] == "--worktree" {
+		reg, err := state.NewRegistryStore(defaultStateDir())
+		if err != nil {
+			return 1
+		}
+		for _, r := range reg.List("worktree", "", false) {
+			if r.ID == args[1] {
+				if r.OwnerPane != "" && paneIDPattern.MatchString(r.OwnerPane) {
+					return jumpToPane(store, r.OwnerPane)
+				}
+				fmt.Fprintf(os.Stderr, "beacon: worktree %s has no live owner pane\n", args[1])
+				return 1
+			}
+		}
+		fmt.Fprintf(os.Stderr, "beacon: no registered worktree %q\n", args[1])
+		return 1
+	}
 	// If a pane ID argument is given, jump directly to that pane.
 	if len(args) > 0 {
 		pane := args[0]
@@ -639,6 +660,157 @@ func cmdTabs(args []string) int {
 			r.ID, r.OwnerPane, now-r.CreatedAt, label, staleMark)
 	}
 	return 0
+}
+
+// cmdWorktrees lists registered worktrees with live pane occupancy derived at
+// read time: tmux pane_current_path → git toplevel. No agent→repo registration
+// is needed — a pane's position in a worktree is derivable, so only the
+// worktree itself (carrying port/slug metadata) is a registry resource.
+// beacon worktrees [--json] [--pick]  — pick jumps to the owner pane.
+func cmdWorktrees(args []string) int {
+	asJSON, pick := false, false
+	for _, a := range args {
+		switch a {
+		case "--json":
+			asJSON = true
+		case "--pick":
+			pick = true
+		}
+	}
+	reg, err := state.NewRegistryStore(defaultStateDir())
+	if err != nil {
+		return 1
+	}
+	recs := reconcileWorktrees(reg, reg.List("worktree", "", false))
+	occ := paneToplevels()
+	if pick {
+		store, err := state.NewStore(defaultStateDir())
+		if err != nil {
+			return 1
+		}
+		return pickWorktree(store, recs)
+	}
+	if asJSON {
+		out, _ := json.Marshal(recs)
+		fmt.Println(string(out))
+		return 0
+	}
+	if len(recs) == 0 {
+		fmt.Println("no registered worktrees (devproxy register <path>)")
+	} else {
+		for _, r := range recs {
+			port, _ := r.Metadata["port"].(float64)
+			slug, _ := r.Metadata["slug"].(string)
+			branch, _ := r.Metadata["branch"].(string)
+			repo, _ := r.Metadata["repo"].(string)
+			panes := occ[r.ID]
+			occStr := ""
+			if len(panes) > 0 {
+				occStr = "  in=" + strings.Join(panes, ",")
+				if len(panes) > 1 {
+					occStr += " SHARED"
+				}
+			}
+			fmt.Printf("%-48s port=%-4d %-14s repo=%-14s branch=%-20s owner=%s%s\n",
+				r.ID, int(port), slug, repo, branch, r.OwnerPane, occStr)
+		}
+	}
+	// Shared-checkout warning: panes whose cwd resolves to the same toplevel,
+	// registered or not — the signal that a worktree split is overdue.
+	for top, panes := range occ {
+		if len(panes) > 1 {
+			fmt.Printf("shared checkout: %s ← panes %s\n", top, strings.Join(panes, ","))
+		}
+	}
+	return 0
+}
+
+// reconcileWorktrees drops registry worktree records whose path is gone.
+func reconcileWorktrees(reg *state.RegistryStore, recs []state.ResourceRecord) []state.ResourceRecord {
+	out := recs[:0]
+	for _, r := range recs {
+		if _, err := os.Stat(r.ID); err != nil {
+			_ = reg.Remove(r.Type, r.ID)
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// paneToplevels maps each live pane's cwd to its git toplevel.
+// map[toplevel][]paneID — pull model, always fresh.
+func paneToplevels() map[string][]string {
+	out, err := exec.Command(tmuxBin(), "list-panes", "-a", "-F", "#{pane_id}\t#{pane_current_path}").Output()
+	if err != nil {
+		return nil
+	}
+	m := map[string][]string{}
+	for _, line := range strings.Split(string(out), "\n") {
+		parts := strings.SplitN(strings.TrimSpace(line), "\t", 2)
+		if len(parts) < 2 || parts[1] == "" {
+			continue
+		}
+		if top := gitToplevel(parts[1]); top != "" {
+			m[top] = append(m[top], parts[0])
+		}
+	}
+	return m
+}
+
+func gitToplevel(dir string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// pickWorktree is the tmux-popup selector for worktrees; selection jumps to
+// the owner pane.
+func pickWorktree(store *state.Store, recs []state.ResourceRecord) int {
+	if len(recs) == 0 {
+		fmt.Println("no registered worktrees")
+		return 0
+	}
+	labels := make([]string, len(recs))
+	for i, r := range recs {
+		slug, _ := r.Metadata["slug"].(string)
+		branch, _ := r.Metadata["branch"].(string)
+		labels[i] = fmt.Sprintf("%s\t%s %s %s", r.ID, slug, branch, r.OwnerPane)
+	}
+	var picked string
+	if fzf, err := exec.LookPath("fzf"); err == nil {
+		cmd := exec.Command(fzf, "--with-nth=2..", "--header=worktrees — enter to jump to owner pane")
+		cmd.Stdin = strings.NewReader(strings.Join(labels, "\n") + "\n")
+		out, err := cmd.Output()
+		if err != nil {
+			return 0
+		}
+		picked = strings.Fields(string(out))[0]
+	} else {
+		for i, l := range labels {
+			fmt.Printf("%2d) %s\n", i+1, l)
+		}
+		fmt.Print("jump to # ")
+		var n int
+		if _, err := fmt.Scan(&n); err != nil || n < 1 || n > len(recs) {
+			return 0
+		}
+		picked = recs[n-1].ID
+	}
+	for _, r := range recs {
+		if r.ID == picked {
+			if r.OwnerPane != "" && paneIDPattern.MatchString(r.OwnerPane) {
+				return jumpToPane(store, r.OwnerPane)
+			}
+			fmt.Fprintf(os.Stderr, "beacon: worktree %s has no live owner pane\n", picked)
+			return 1
+		}
+	}
+	return 1
 }
 
 // reconcileLiveTabs drops registry tab records whose CDP target is gone.
