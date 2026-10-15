@@ -1767,17 +1767,21 @@ func jumpToPane(store *state.Store, pane string) int {
 // target session/pane. Returns false if no client is attached or any
 // tmux command fails. Fail-closed: every step must succeed.
 // Client selection priority:
-//  1. A client already in the target session.
-//  2. The most recently active client (by client_activity).
+//  1. A real-tty client over control-mode (empty tty) clients — switching
+//     a control client moves nothing the user can see.
+//  2. A client already in the target session.
+//  3. The most recently active client (by client_activity).
 func switchToTarget(session, paneID string) bool {
 	tb := tmuxBin()
-	// List clients: tty|session_name|activity_timestamp
-	out, err := exec.Command(tb, "list-clients", "-F", "#{client_tty}|#{session_name}|#{client_activity}").Output()
+	// client_name is always set and accepted by switch-client -c;
+	// client_tty is empty for control-mode clients.
+	out, err := exec.Command(tb, "list-clients", "-F", "#{client_name}|#{client_tty}|#{session_name}|#{client_activity}").Output()
 	if err != nil {
 		return false
 	}
 	type clientInfo struct {
-		tty      string
+		name     string
+		hasTTY   bool
 		session  string
 		activity int64
 	}
@@ -1787,40 +1791,43 @@ func switchToTarget(session, paneID string) bool {
 		if line == "" {
 			continue
 		}
-		fields := strings.SplitN(line, "|", 3)
-		if len(fields) < 3 {
+		fields := strings.SplitN(line, "|", 4)
+		if len(fields) < 4 {
 			continue
 		}
-		act, _ := strconv.ParseInt(strings.TrimSpace(fields[2]), 10, 64)
+		act, _ := strconv.ParseInt(strings.TrimSpace(fields[3]), 10, 64)
 		clients = append(clients, clientInfo{
-			tty:      strings.TrimSpace(fields[0]),
-			session:  strings.TrimSpace(fields[1]),
+			name:     strings.TrimSpace(fields[0]),
+			hasTTY:   strings.TrimSpace(fields[1]) != "",
+			session:  strings.TrimSpace(fields[2]),
 			activity: act,
 		})
 	}
 	if len(clients) == 0 {
 		return false
 	}
-	// Prefer a client already in the target session.
-	// Among those, pick the most recently active.
-	// If none in target session, pick the most recently active overall.
+	// Score: has-tty(2) + in-session(1); tie-break on activity.
 	var best *clientInfo
+	bestScore := -1
 	for i := range clients {
 		c := &clients[i]
+		score := 0
+		if c.hasTTY {
+			score += 2
+		}
 		if c.session == session {
-			if best == nil || best.session != session || c.activity > best.activity {
-				best = c
-			}
-		} else if best == nil || (best.session != session && c.activity > best.activity) {
-			best = c
+			score++
+		}
+		if score > bestScore || (score == bestScore && c.activity > best.activity) {
+			best, bestScore = c, score
 		}
 	}
 	if best == nil {
 		return false
 	}
-	// switch-client -c client_tty -t session — must succeed.
-	if err := exec.Command(tb, "switch-client", "-c", best.tty, "-t", session).Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "beacon: switch-client -c %s -t %s failed: %v\n", best.tty, session, err)
+	// switch-client -c client_name -t session — must succeed.
+	if err := exec.Command(tb, "switch-client", "-c", best.name, "-t", session).Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "beacon: switch-client -c %s -t %s failed: %v\n", best.name, session, err)
 		return false
 	}
 	// Query the window ID for the pane.
