@@ -97,7 +97,7 @@ case "${1:-}" in
     done
     case "$fmt" in
       *'#{pane_id}'*) printf '/dev/ttys000|%%1\n' ;;
-      *) printf '/dev/ttys000|test-session|1000\n' ;;
+      *) printf '/dev/ttys000|/dev/ttys000|test-session|1000\n' ;;
     esac
     ;;
   set-option) : ;;
@@ -1122,7 +1122,7 @@ case "$cmd" in
     done
     case "$fmt" in
       *'#{pane_id}'*) printf '/dev/ttys000|%%1\n' ;;
-      *) printf '/dev/ttys000|test-session|1000\n' ;;
+      *) printf '/dev/ttys000|/dev/ttys000|test-session|1000\n' ;;
     esac
     ;;
   set-option) : ;;
@@ -1147,7 +1147,7 @@ esac
     done
     case "$fmt" in
       *'#{pane_id}'*) printf '/dev/ttys000|%%1\n' ;;
-      *) printf '/dev/ttys000|test-session|1000\n' ;;
+      *) printf '/dev/ttys000|/dev/ttys000|test-session|1000\n' ;;
     esac
     ;;`,
 			`  list-clients) exit 1 ;;`, 1)
